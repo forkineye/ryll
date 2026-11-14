@@ -333,6 +333,13 @@ dropped session does not retry against a now-dead ticket -- it
 suppresses ryll's auto-reconnect for this single-use ticket, per the
 [Ticket lifecycle keys](#ticket-lifecycle-keys) above.
 
+On macOS, the optional
+[Chrome `.vv` handler](https://github.com/shakenfist/ryll/tree/develop/contrib/chrome-vv-handler)
+starts ryll as soon as Chrome finishes downloading a `.vv` file, so the
+ticket window is not spent finding and opening the download. It is a local
+desktop integration rather than part of the ryll binary; its README covers
+installation, security and uninstalling.
+
 This example is exercised, not just documented: [the Proxmox
 lane](ci.md#the-proxmox-lane) mints a `.vv` in this shape against a
 real Proxmox VE node on every pull request from this repository that

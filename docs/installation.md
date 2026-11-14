@@ -64,6 +64,10 @@ tar xzf ryll-0.1.0-aarch64-apple-darwin.tar.gz
 cp ryll /usr/local/bin/
 ```
 
+To open Proxmox `.vv` downloads directly in ryll from Chrome, see the
+[Chrome `.vv` handler](https://github.com/shakenfist/ryll/tree/develop/contrib/chrome-vv-handler).
+It is a separate local integration, not part of the Homebrew package.
+
 ## Windows
 
 Download the `.zip` archive for your architecture from

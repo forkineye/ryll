@@ -1,0 +1,12 @@
+{
+  "manifest_version": 3,
+  "name": "ryll .vv launcher",
+  "version": "1.0.0",
+  "description": "Launch ryll whenever a .vv SPICE console file is downloaded.",
+  "minimum_chrome_version": "116",
+  "permissions": ["downloads", "nativeMessaging"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqcIXoFYu4ZDvXs3aHELzcV4vAmH/Uk7UuZbYOJmJ9J8LLPN61wkXQXpKx8tqWPm0mUndNs5A6x/iVskd8O+bRsOqnCBz4v/mfKX4eokIJDn7RzW8UGanEaXFrsAJn6ci46C4ZubKDiCveB+yj6i5Iy2TBNaE6/hXaOS8JE+BXNEzOA3D+j45cf5Ig0MK/oDWOVfWHmiDgAzLTSmsJrZ3YAFodIFV04kdKMyGdvbvi8MLPiCaAwNOHY6B+4vpDjn5trA+YQGkLOEOgELSM2wL9d+HqA3QxLoy1APl04oqlUvR8AMFgrQXK+Q7TBfpKMsU/wjq/BUVNcWo4ePKoS/K2wIDAQAB"
+}

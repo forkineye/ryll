@@ -173,10 +173,6 @@
       "sha": "76c732cf34ff7fb901bd042373fd699b8bac1d1f",
       "date": "2026-10-17"
     },
-    "ryll/src/app/resize.rs": {
-      "sha": "255eff1eefba2e7cb50f981662e61cc77ca5a3d3",
-      "date": "2026-10-17"
-    },
     "ryll/src/app/session_init.rs": {
       "sha": "2bcdae8100211a0be291fc150461d53cc7f402d7",
       "date": "2026-10-17"

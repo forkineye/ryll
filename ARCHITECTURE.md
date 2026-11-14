@@ -179,13 +179,15 @@ ryll/src/
 │   │                    #   thread lifecycle, critical-disconnect handling
 │   ├── events.rs        #   process_events: ChannelEvent dispatch and
 │   │                    #   the per-event handlers
-│   ├── mod.rs           #   RyllApp struct and fields, eframe::App impl
-│   │                    #   (logic, ui), panels and dialogs
+│   ├── mod.rs           #   RyllApp struct and fields, construction,
+│   │                    #   eframe::App impl: logic and the ui call
+│   │                    #   sequence
 │   ├── notification_snapshots.rs
 │   │                    #   NotificationSnapshotStore
 │   ├── proxmox_ui.rs    #   Proxmox login form and VM picker
 │   ├── reconnect.rs     #   ReconnectState, modal variants
-│   ├── resize.rs        #   Auto-fit and outgoing-resize decisions
+│   ├── resize.rs        #   Auto-fit and outgoing-resize decisions,
+│   │                    #   the viewport fit and the resize senders
 │   ├── root.rs          #   RyllRoot eframe App: session or Proxmox
 │   │                    #   launcher, SessionSetup, capture hand-off
 │   ├── screenshots.rs   #   Screenshot dialog and per-surface PNG saving
@@ -194,6 +196,28 @@ ryll/src/
 │   ├── trigger_snapshot.rs
 │   │                    #   TriggerSnapshot, window screenshot, region
 │   │                    #   select for bug reports
+│   ├── ui/              #   Draw code: the panels, windows and overlays
+│   │   ├── cursor.rs    #     Cursor texture, the overlay, and hiding
+│   │   │                #     the host cursor over the surface
+│   │   ├── dialogs.rs   #     Bug report, paste error, protocol gaps
+│   │   │                #     and reconnect windows
+│   │   ├── keys.rs      #     Keyboard focus gate, hotkeys, input
+│   │   │                #     handling, held-key release
+│   │   ├── mod.rs       #     Declares the draw modules
+│   │   ├── notifications_panel.rs
+│   │   │                #     Notifications side panel
+│   │   ├── region_select.rs
+│   │   │                #     Region-select overlay for bug reports
+│   │   ├── stats_bar.rs #     Status bar: metrics, volume, the
+│   │   │                #     streaming, agent and bell indicators,
+│   │   │                #     the sparkline and the panel menu
+│   │   ├── surface.rs   #     Central panel: the remote surface, its
+│   │   │                #     error banner, pointer and wheel handling
+│   │   ├── traffic_panel.rs
+│   │   │                #     Traffic viewer side panel
+│   │   ├── usb_panel.rs #     USB redirection side panel
+│   │   └── webdav_panel.rs
+│   │                    #     WebDAV sharing side panel
 │   └── ui_state.rs      #   UiStateTracker: which panels and dialogs are
 │                        #   open, for bug reports
 ├── auto_snapshot.rs     # --auto-snapshot-interval background task,

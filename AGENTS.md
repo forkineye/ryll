@@ -248,6 +248,10 @@ an ungated use. `make lint` also builds ryll with
 `digest-decode` match arms, so a new `ChannelEvent` variant must be
 cfg-correct with that feature on as well as off.
 
+Items in `ryll/src/app/ui/` are `pub(in crate::app)`, not
+`pub(super)`: `pub(super)` from a grandchild of `app` reaches only
+`app::ui`, and the callers are in `app` itself.
+
 ## Process documents
 
 Four process documents at the repo root capture the

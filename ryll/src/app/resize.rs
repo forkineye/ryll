@@ -1,7 +1,11 @@
+use eframe::egui;
 use std::time::{Duration, Instant};
 
 use shakenfist_spice_renderer::channels::{align_monitor_dimension, DisplaySize};
 use tokio::sync::mpsc;
+use tracing::info;
+
+use crate::app::RyllApp;
 
 /// Approximate height of the stats bar at the bottom of the window
 pub(super) const STATS_BAR_HEIGHT: f32 = 20.0;
@@ -162,6 +166,82 @@ pub(super) fn send_guest_size(tx: &mpsc::Sender<DisplaySize>, pending: &mut Opti
     match tx.try_send(DisplaySize::GuestHas(width, height)) {
         Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => *pending = None,
         Err(mpsc::error::TrySendError::Full(_)) => {}
+    }
+}
+
+impl RyllApp {
+    /// Fit the window to the remote surface, then tell the guest what
+    /// size it is being drawn at.
+    pub(super) fn fit_viewport_to_surface(&mut self, ctx: &egui::Context) {
+        // Resize viewport to match the remote surface (plus stats
+        // bar) whenever a new primary surface differs from the
+        // size we last fitted to. Maximised/fullscreen windows
+        // are left alone — we cannot meaningfully change their
+        // inner size, and the surface will render at native size
+        // inside the available area.
+        let pending = self.pending_resize.take();
+        let is_max = ctx.input(|i| {
+            i.viewport().maximized.unwrap_or(false) || i.viewport().fullscreen.unwrap_or(false)
+        });
+        if let Some((w, h, aw, ah)) =
+            compute_auto_resize(pending, self.last_auto_resize, is_max, self.obey_guest_size)
+        {
+            let total_h = h + STATS_BAR_HEIGHT;
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(w, total_h)));
+            // Seed last_sent_resize so maybe_send_monitors_resize
+            // doesn't echo our own resize back to the guest as a
+            // VDAgentMonitorsConfig change, and tell the main channel
+            // the guest has this size, so it drops any size it is
+            // still holding for an agent rather than sending it.
+            self.last_sent_resize = Some((aw, ah));
+            self.pending_guest_size = Some((aw, ah));
+            self.last_auto_resize = Some((aw, ah));
+            info!("app: window resize to {}x{} (surface)", w as u32, h as u32);
+        }
+
+        self.maybe_send_monitors_resize(ctx);
+    }
+
+    /// Tell the main channel the size the window last auto-fitted to,
+    /// if that is still to do. On a full queue it stays pending for the
+    /// next frame; on a closed one the session is gone and it is moot.
+    fn send_pending_guest_size(&mut self) {
+        if let Some(tx) = &self.resize_tx {
+            send_guest_size(tx, &mut self.pending_guest_size);
+        }
+    }
+
+    fn maybe_send_monitors_resize(&mut self, ctx: &egui::Context) {
+        // First, so that it reaches the main channel ahead of any size
+        // requested below, which supersedes it.
+        self.send_pending_guest_size();
+        let Some(tx) = &self.resize_tx else {
+            return;
+        };
+
+        let viewport_size = ctx.input(|i| {
+            i.viewport()
+                .inner_rect
+                .map(|rect| rect.size())
+                .unwrap_or_else(|| i.viewport_rect().size())
+        });
+
+        let is_max = ctx.input(|i| {
+            i.viewport().maximized.unwrap_or(false) || i.viewport().fullscreen.unwrap_or(false)
+        });
+
+        let (width, height) = compute_outgoing_resize((viewport_size.x, viewport_size.y), is_max);
+
+        if self.last_sent_resize == Some((width, height)) {
+            return;
+        }
+
+        if tx.try_send(DisplaySize::Requested(width, height)).is_ok() {
+            self.last_sent_resize = Some((width, height));
+            // Queued behind it or in place of it: either way the main
+            // channel's last word is now this request.
+            self.pending_guest_size = None;
+        }
     }
 }
 

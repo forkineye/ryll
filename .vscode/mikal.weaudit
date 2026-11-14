@@ -520,10 +520,6 @@
       "author": "mikal"
     },
     {
-      "path": "ryll/src/app/resize.rs",
-      "author": "mikal"
-    },
-    {
       "path": "ryll/src/app/session_init.rs",
       "author": "mikal"
     },

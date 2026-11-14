@@ -85,6 +85,7 @@ both ends of the traffic through the proxy. This would allow:
 - [Features](features.md) - The detailed feature catalogue and mode guides
 - [Installation](installation.md) - Pre-built packages, pip, and building from source
 - [Configuration](configuration.md) - CLI options and .vv file format
+- [Proxmox VE](proxmox.md) - Logging in, listing guests, and connecting to a SPICE console
 - [Web frontend](web-frontend.md) - Operator guide for `--web` mode
 - [RDP frontend](rdp-frontend.md) - Operator guide for `--rdp` mode
 - [Kasm workspace](kasm-workspace.md) - Packaging the ryll GUI as a Kasm Workspaces image

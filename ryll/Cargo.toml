@@ -113,8 +113,11 @@ console-subscriber = { version = "0.5", optional = true }
 # Config file parsing
 configparser = "3"
 
-# HTTP for URL config fetching
-reqwest = { version = "0.13", features = ["blocking"] }
+# HTTP for URL config fetching and the Proxmox VE API. `json` parses
+# the cluster-resource and login responses; `form` sends the login and
+# `spiceproxy` requests. `blocking` lets the GUI's login and VM-list
+# work run on a plain thread, outside the session's tokio runtime.
+reqwest = { version = "0.13", features = ["blocking", "form", "json"] }
 
 # LZ4 compression/decompression for general data (webdav, usbredir).
 # SPICE image LZ4 lives in shakenfist-spice-compression below.

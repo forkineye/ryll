@@ -15,6 +15,7 @@ ryll [OPTIONS]
 | `--url <URL>` | Fetch .vv configuration file from HTTP URL |
 | `--file <PATH>` | Load .vv configuration from local file |
 | `--direct <CONN>` | Direct connection: `HOST:PORT` or `HOST:PORT:TLS_PORT` |
+| `--proxmox <URL>` | Log in to Proxmox VE, list the visible QEMU guests, and request a SPICE console. See [Proxmox VE](proxmox.md) |
 | `--password-file <PATH>` | With `--direct`, read the SPICE password from a file. One trailing newline is stripped, so a server's ticket file (andris's `~/.config/andris/ticket`, for example) works as-is. An empty or unreadable file fails the launch. A `.vv` file carries its own `password`, so this is refused with `--url` and `--file` |
 
 ### Operating Modes
@@ -164,6 +165,61 @@ ryll --file test.vv --auto-snapshot-interval 30 \
 # Pedantic mode: report on protocol gaps
 ryll --file test.vv --pedantic
 ```
+
+## Proxmox VE
+
+`--proxmox` is a connection source of its own: ryll logs in to the
+Proxmox VE API, lists the QEMU guests the login can see, and asks Proxmox
+for the chosen guest's SPICE console document. It does not implement VM
+management. The list uses each node's QEMU index, which Proxmox filters to
+the guests where the login has `VM.Audit`; granting that privilege on
+individual `/vms/<vmid>` paths is enough, and `/vms` itself need not be
+granted. The operator guide, including permissions, TLS and troubleshooting,
+is [proxmox.md](proxmox.md); this table is the flag reference.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--proxmox <URL>` | none | Proxmox VE API URL. The scheme defaults to `https` and the port to 8006; a pasted `/api2/json` suffix is tolerated. Excludes `--url`, `--file` and `--direct` |
+| `--proxmox-user <USER>` | none | Proxmox user ID for password authentication, such as `root@pam` |
+| `--proxmox-password <PASSWORD>` | none | Password for `--proxmox-user`. Visible in the process list; prefer the file form on a shared host |
+| `--proxmox-password-file <PATH>` | none | Read the password from a file, stripping one trailing newline |
+| `--proxmox-token <TOKEN>` | none | API token as `USER@REALM!TOKENID=SECRET`. The `PVEAPIToken=` prefix is accepted |
+| `--proxmox-token-file <PATH>` | none | Read the API token from a file, stripping one trailing newline |
+| `--proxmox-ca <PATH>` | platform roots | PEM CA or chain to trust for the API connection. Conflicts with `--proxmox-insecure` |
+| `--proxmox-insecure` | false | Accept any API certificate, for a self-signed Proxmox that has no stable CA. Conflicts with `--proxmox-ca` |
+| `--proxmox-proxy <HOST>` | Proxmox's choice | Ask Proxmox to put this host in the console document's `proxy=` key. Omit to let it choose the guest's node |
+| `--proxmox-vm <VMID>` | none | Guest to connect to. Required with `--headless`, `--web` and `--rdp`; optional in the GUI, where it skips the picker once the list arrives |
+| `--proxmox-list` | false | Log in, print the visible QEMU guests as a tab-separated table, and exit. Conflicts with `--proxmox-vm` |
+| `--proxmox-save` | false | Save the endpoint, API token and TLS choice to `~/.ryll/config.json` after a successful token login. Password logins are never saved |
+
+In the GUI, `--proxmox` with no credentials opens a login form and then a
+VM picker; only running, non-template QEMU guests can be connected. In
+`--headless`, `--web` and `--rdp` modes, credentials and `--proxmox-vm` are
+required:
+
+```bash
+# Discover the VM IDs this login can reach, saving the token for later
+ryll --proxmox https://pve.example:8006 \
+     --proxmox-token-file ~/.ryll/pve.token --proxmox-list --proxmox-save
+
+# Connect headlessly to VM 100, reusing the saved token
+ryll --proxmox https://pve.example:8006 --proxmox-vm 100 --headless
+
+# Open the GUI picker
+ryll --proxmox https://pve.example:8006
+```
+
+The saved file is `~/.ryll/config.json` (directory `0700`, file `0600` on
+Unix). It stores the endpoint, API token and TLS choice, never a password.
+The GUI offers a **Remember this token** checkbox and a **Forget saved token**
+button; a GUI launch that would use a saved token asks first unless
+auto-connect has been enabled. A saved token is only used for the endpoint it
+was saved with. See [Proxmox VE](proxmox.md#saved-configuration) for the file
+format, `RYLL_CONFIG_DIR`, and the launch prompt.
+
+A Proxmox console ticket is short-lived and single-use. Ryll therefore
+suppresses automatic reconnect for these sessions, exactly as it does for a
+`.vv` with `delete-this-file=1`; relaunch to get a fresh document.
 
 ## .vv File Format
 

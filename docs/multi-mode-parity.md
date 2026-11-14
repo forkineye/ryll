@@ -75,7 +75,8 @@ poller), media socket binding added 2026-08-21, clipboard and
 resize rows refreshed 2026-10-14 (control protocol 1.3), display,
 streaming and statistics rows refreshed 2026-10-16 (control protocol
 1.4's `stats` verb), RDP column and *RDP frontend* section added
-2026-10-27, each cell judged from `run_rdp`.
+2026-10-27, each cell judged from `run_rdp`, Proxmox connection rows added
+2026-11-14 (GUI picker; `--proxmox-vm` selection in the other modes; saved token and per-VM ACL discovery added the same day).
 
 ## Parity matrix
 
@@ -100,6 +101,11 @@ socket), supervises SPICE reconnects, and hands the session to the
 | TLS / secure channel (inline CA from .vv) | available | available | available | available |
 | HTTP CONNECT proxy (`proxy=` in .vv) | available | available | available (every mode builds the same `ConnectionConfig`) | available (`run_rdp` builds the same `ConnectionConfig` as the other modes) |
 | Password authentication | available | available | available | available |
+| Proxmox VE connection source (`--proxmox`) | available (login form and VM picker) | available (`--proxmox-vm`; `--proxmox-list` prints the IDs) | available (`--proxmox-vm`; the browser has no picker, so the ID must come from `--proxmox-list`) | available (`--proxmox-vm`; the RDP client has no picker, so the ID must come from `--proxmox-list`) |
+| Proxmox password or API-token authentication | available | available | available | available |
+| Saved Proxmox endpoint/token (`~/.ryll/config.json`) | available (Remember, Forget, launch prompt and auto-connect) | available (`--proxmox` reuses a matching saved token; `--proxmox-save` writes one) | available (same as headless; no browser prompt) | available (same as headless; no RDP-client prompt) |
+| Proxmox per-VM ACL discovery (`VM.Audit` on `/vms/{vmid}`) | available (per-node QEMU index) | available | available (same discovery) | available (same discovery) |
+| Proxmox VM listing / discovery | available | available (`--proxmox-list`, a tab-separated table on stdout) | partial (`--proxmox-list` works on the host, but the browser UI has no VM list; the ID is still passed with `--proxmox-vm`) | partial (`--proxmox-list` works on the host, but the RDP client has no VM list; the ID is still passed with `--proxmox-vm`) |
 | **Control socket** | | | | |
 | Control socket (`--control-socket`) | n/a — intrinsic (the window owns input and the surface; combining with the GUI is a CLI error) | available | available | available (wired to the session's fixed ends, so a SPICE reconnect does not disturb it) |
 | Session state query (`status` verb) | n/a — intrinsic | available | available (`run_web` builds a `SessionStatus` from the same `spice_connected` flag, `SessionState` agent watch and surface mirror headless uses) | available (`run_rdp` builds a `SessionStatus` from a `connected` flag and agent watch that each SPICE attempt updates, so `status` reports SPICE down during an outage and up again after a reconnect) |

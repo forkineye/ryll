@@ -83,6 +83,99 @@ pub struct Args {
     #[arg(long, value_name = "PATH", requires = "direct", conflicts_with_all = ["url", "file"])]
     pub password_file: Option<PathBuf>,
 
+    /// Connect through the Proxmox VE API instead of using a .vv file.
+    /// Ryll logs in, lists the QEMU guests the credentials can see, and
+    /// asks Proxmox for the chosen guest's SPICE console document. The
+    /// GUI opens a login and VM picker; --headless, --web and --rdp
+    /// require --proxmox-vm (or --proxmox-list). This flag does not
+    /// create, start, stop or reconfigure guests: ryll only asks
+    /// Proxmox for a SPICE console.
+    #[arg(
+        long,
+        group = "config_source",
+        value_name = "URL",
+        conflicts_with = "password_file"
+    )]
+    pub proxmox: Option<String>,
+
+    /// Proxmox username for password authentication, in the form
+    /// `user@realm` (for example `root@pam`). GUI mode may leave the
+    /// password to the login form.
+    #[arg(long, value_name = "USER", requires = "proxmox",
+          conflicts_with_all = ["proxmox_token", "proxmox_token_file"])]
+    pub proxmox_user: Option<String>,
+
+    /// Proxmox password for password authentication. Visible in the
+    /// process list on a shared host; prefer the GUI login form or
+    /// --proxmox-password-file.
+    #[arg(long, value_name = "PASSWORD", requires = "proxmox",
+          conflicts_with_all = ["proxmox_password_file", "proxmox_token", "proxmox_token_file"])]
+    pub proxmox_password: Option<String>,
+
+    /// Read the Proxmox password from <PATH>. One trailing newline is
+    /// stripped, matching --password-file.
+    #[arg(long, value_name = "PATH", requires = "proxmox",
+          conflicts_with_all = ["proxmox_password", "proxmox_token", "proxmox_token_file"])]
+    pub proxmox_password_file: Option<PathBuf>,
+
+    /// Proxmox API token in the form
+    /// `USER@REALM!TOKENID=SECRET`. The `PVEAPIToken=` prefix is also
+    /// accepted. Visible in the process list on a shared host; prefer
+    /// the GUI login form or --proxmox-token-file.
+    #[arg(long, value_name = "TOKEN", requires = "proxmox",
+          conflicts_with_all = ["proxmox_user", "proxmox_password", "proxmox_password_file",
+                                "proxmox_token_file"])]
+    pub proxmox_token: Option<String>,
+
+    /// Read the Proxmox API token from <PATH>. One trailing newline is
+    /// stripped.
+    #[arg(long, value_name = "PATH", requires = "proxmox",
+          conflicts_with_all = ["proxmox_user", "proxmox_password", "proxmox_password_file",
+                                "proxmox_token"])]
+    pub proxmox_token_file: Option<PathBuf>,
+
+    /// Accept the Proxmox API's TLS certificate without verifying it.
+    /// Proxmox installs a self-signed certificate by default. Prefer
+    /// --proxmox-ca when the certificate is stable.
+    #[arg(long, requires = "proxmox", conflicts_with = "proxmox_ca")]
+    pub proxmox_insecure: bool,
+
+    /// PEM file holding the CA (or CA chain) that signed the Proxmox
+    /// API certificate. Trust is added to the platform roots rather
+    /// than replacing them.
+    #[arg(
+        long,
+        value_name = "PATH",
+        requires = "proxmox",
+        conflicts_with = "proxmox_insecure"
+    )]
+    pub proxmox_ca: Option<PathBuf>,
+
+    /// SPICE proxy host to ask Proxmox to put in the console document.
+    /// Defaults to Proxmox's choice, the node where the VM is running.
+    #[arg(long, value_name = "HOST", requires = "proxmox")]
+    pub proxmox_proxy: Option<String>,
+
+    /// VM ID to connect to without an interactive picker. Required with
+    /// --proxmox in --headless, --web and --rdp modes.
+    #[arg(long, value_name = "VMID", requires = "proxmox",
+          value_parser = clap::value_parser!(u32).range(1..))]
+    pub proxmox_vm: Option<u32>,
+
+    /// Log in to Proxmox, print the QEMU VMs the credentials can see,
+    /// and exit without connecting. Works in every mode; useful for
+    /// discovering the ID to pass to --proxmox-vm.
+    #[arg(long, requires = "proxmox", conflicts_with = "proxmox_vm")]
+    pub proxmox_list: bool,
+
+    /// Save the Proxmox endpoint, API token and TLS choice to
+    /// ~/.ryll/config.json after a successful login and VM list. Only
+    /// API tokens are stored: a username/password login is never
+    /// written, and combining this flag with a password login logs a
+    /// warning instead.
+    #[arg(long, requires = "proxmox")]
+    pub proxmox_save: bool,
+
     /// Run in headless mode (no GUI). Mutually exclusive with
     /// --web and --rdp; the conflict is declared on those flags.
     #[arg(long, default_value_t = false)]
@@ -618,7 +711,9 @@ impl Config {
             }
             Ok(config)
         } else {
-            Err(anyhow!("Must specify one of --url, --file, or --direct"))
+            Err(anyhow!(
+                "Must specify one of --url, --file, --direct, or --proxmox"
+            ))
         }
     }
 
@@ -701,8 +796,13 @@ impl Config {
         }
     }
 
-    /// Parse .vv file content (INI format)
-    fn parse_vv_content(content: &str) -> Result<Self> {
+    /// Parse .vv file content (INI format).
+    ///
+    /// `pub(crate)` because the Proxmox connection source receives the
+    /// same document from Proxmox's `spiceproxy` endpoint and feeds it
+    /// through this parser rather than maintaining a second mapping
+    /// from the document's keys to [`Config`].
+    pub(crate) fn parse_vv_content(content: &str) -> Result<Self> {
         let mut ini = Ini::new();
         ini.read(content.to_string())
             .map_err(|e| anyhow!("Failed to parse .vv file: {}", e))?;
@@ -917,16 +1017,26 @@ fn validate_disk_path(path: &Path) -> Result<()> {
 /// refused, because it almost always means the wrong file. Errors name
 /// the path but never echo the file's contents.
 fn read_password_file(path: &Path) -> Result<String> {
-    let content = fs::read_to_string(path)
-        .map_err(|e| anyhow!("--password-file {}: {}", path.display(), e))?;
-    let password = content
+    read_secret_file(path, "--password-file")
+}
+
+/// Read a one-line secret (a SPICE or Proxmox password, or an API
+/// token) from `path`, stripping one trailing newline.
+///
+/// `flag` is the command-line option being satisfied, so the error
+/// names the flag and file the user actually passed. The secret itself
+/// is never included in an error.
+pub(crate) fn read_secret_file(path: &Path, flag: &str) -> Result<String> {
+    let content =
+        fs::read_to_string(path).map_err(|e| anyhow!("{} {}: {}", flag, path.display(), e))?;
+    let secret = content
         .strip_suffix('\n')
         .map(|s| s.strip_suffix('\r').unwrap_or(s))
         .unwrap_or(&content);
-    if password.is_empty() {
-        bail!("--password-file {}: the file is empty", path.display());
+    if secret.is_empty() {
+        bail!("{} {}: the file is empty", flag, path.display());
     }
-    Ok(password.to_string())
+    Ok(secret.to_string())
 }
 
 #[cfg(test)]

@@ -52,13 +52,17 @@ mod bug_report;
 mod connection;
 mod events;
 mod notification_snapshots;
+mod proxmox_ui;
 mod reconnect;
 mod resize;
+mod root;
 mod screenshots;
 mod session_init;
 mod stats;
 mod trigger_snapshot;
 mod ui_state;
+
+pub(crate) use root::{RyllRoot, SessionSetup};
 
 use agent_state::{mac_paste_chord, paste_hint, AgentState};
 use bug_report::{PendingBugReport, PendingDisconnectReport};
@@ -522,7 +526,7 @@ pub struct RyllApp {
 impl RyllApp {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        cc: &eframe::CreationContext<'_>,
+        ctx: &egui::Context,
         config: Config,
         cadence: bool,
         enable_paste: bool,
@@ -601,8 +605,9 @@ impl RyllApp {
         let repaint_notify = Arc::new(Notify::new());
         let event_tx_clone = event_tx.clone();
         let resize_rx_for_conn = resize_rx;
-        let ctx = cc.egui_ctx.clone();
-        let bridge_ctx = cc.egui_ctx.clone();
+        let connection_ctx = ctx.clone();
+        let bridge_ctx = ctx.clone();
+        let egui_ctx = ctx.clone();
         let bridge_notify = repaint_notify.clone();
         let conn_notify = repaint_notify.clone();
         let capture_clone: Option<Arc<dyn shakenfist_spice_renderer::CaptureSink>> = capture
@@ -683,7 +688,7 @@ impl RyllApp {
                     let _ = failure_tx.send(message);
                 }
             });
-            ctx.request_repaint();
+            connection_ctx.request_repaint();
         });
 
         RyllApp {
@@ -802,7 +807,7 @@ impl RyllApp {
             monitors,
             reconnect_virtual_disks: virtual_disks,
             reconnect_share_dir: share_dir,
-            egui_ctx: cc.egui_ctx.clone(),
+            egui_ctx,
             connection_cancel: Some(connection_cancel),
             connection_failure_rx: Some(failure_rx),
             pending_connection_failure: None,

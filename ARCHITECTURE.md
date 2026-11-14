@@ -183,8 +183,11 @@ ryll/src/
 │   │                    #   (logic, ui), panels and dialogs
 │   ├── notification_snapshots.rs
 │   │                    #   NotificationSnapshotStore
+│   ├── proxmox_ui.rs    #   Proxmox login form and VM picker
 │   ├── reconnect.rs     #   ReconnectState, modal variants
 │   ├── resize.rs        #   Auto-fit and outgoing-resize decisions
+│   ├── root.rs          #   RyllRoot eframe App: session or Proxmox
+│   │                    #   launcher, SessionSetup, capture hand-off
 │   ├── screenshots.rs   #   Screenshot dialog and per-surface PNG saving
 │   ├── session_init.rs  #   SessionInitialized classification, respawn limit
 │   ├── stats.rs         #   Statistics, bandwidth/latency trackers
@@ -202,10 +205,15 @@ ryll/src/
 │                        #   implements CaptureSink)
 ├── clipboard_arboard.rs # Host clipboard (implements ClipboardBackend)
 ├── config.rs            # CLI args, .vv parsing
+├── config_dir.rs        # ~/.ryll/config.json: saved Proxmox endpoint,
+│                        #   API token, TLS choice and auto-connect flag
 ├── display_gui.rs       # TextureCache: egui TextureHandles
 │                        #   keyed by surface
 ├── input_egui.rs        # egui::Key → LogicalKey adapter
 ├── notifications.rs     # NotificationStore + NotificationStoreSink
+├── proxmox.rs           # --proxmox connection source: Proxmox VE API
+│                        #   login (ticket or API token), VM listing, and
+│                        #   the guest's .vv console document
 ├── rdp.rs               # --rdp mode (the `rdp` feature): run_rdp() entry,
 │                        #   SPICE reconnect supervisor, input relay
 ├── reconnect_policy.rs  # SPICE retry rules (backoff, ticket, flap); no GUI dep

@@ -5,7 +5,9 @@ mod auto_snapshot;
 mod bugreport;
 #[cfg(feature = "capture")]
 mod capture;
+mod config_dir;
 mod notifications;
+mod proxmox;
 #[cfg(feature = "rdp")]
 mod rdp;
 mod reconnect_policy;
@@ -94,7 +96,7 @@ pub static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// `usize`. Uses saturating arithmetic so that on 32-bit platforms
 /// a large user input is clamped to `usize::MAX` rather than
 /// silently truncated by the `as usize` cast.
-fn mib_to_usize_bytes(mib: u64) -> usize {
+pub(crate) fn mib_to_usize_bytes(mib: u64) -> usize {
     mib.saturating_mul(1024 * 1024)
         .try_into()
         .unwrap_or(usize::MAX)
@@ -282,20 +284,71 @@ fn main() -> Result<()> {
         env!("RYLL_GIT_SHA"),
     );
 
-    // Load configuration. Every mode requires a real `.vv` / `--url`
-    // / `--direct`, including `--web`: `run_web` spawns
-    // `run_connection` and actually connects to SPICE.
-    let config = Config::from_args(&args)?;
-    // Built once here for the log line and the capture metadata
-    // below; `run_headless` / `run_web` / `run_gui` each build their
-    // own from the `config` they take by value. `(&config).into()`
-    // borrows, so this doesn't consume it.
-    let startup_connection_config: shakenfist_spice_protocol::ConnectionConfig = (&config).into();
-    info!(
-        "Connecting to {} (TLS: {})",
-        startup_connection_config.display_target(),
-        config.tls_port.is_some()
-    );
+    // Load the user's saved Proxmox settings only when they can matter:
+    // an explicit `--proxmox`, or a GUI launch with no connection source
+    // at all. A `--file` / `--url` / `--direct` launch never consults
+    // them, so a saved token cannot surprise an unrelated session.
+    let gui_mode = !args.headless && !args.web && !args.rdp;
+    let no_explicit_source = args.url.is_none()
+        && args.file.is_none()
+        && args.direct.is_none()
+        && args.proxmox.is_none();
+    let saved_relevant = crate::proxmox::requested(&args) || (gui_mode && no_explicit_source);
+    let saved_config = if saved_relevant {
+        crate::config_dir::load()
+    } else {
+        None
+    };
+    let saved_proxmox = saved_config
+        .as_ref()
+        .and_then(|config| config.proxmox.as_ref());
+
+    // A Proxmox source has its own validation (credential pairing, TLS
+    // choice, and the extra requirements of the non-interactive modes)
+    // because clap cannot express all of it.
+    crate::proxmox::validate_args(&args, saved_proxmox)?;
+
+    // `--proxmox-list` is a discovery command, not a session: resolve
+    // the login, print the table, and leave before any mode starts.
+    if crate::proxmox::requested(&args) && args.proxmox_list {
+        crate::proxmox::print_vm_list(&args, saved_proxmox)?;
+        return Ok(());
+    }
+
+    // Resolve the connection source. Every mode needs a real `.vv`,
+    // `--url`, `--direct` or Proxmox source, including `--web`:
+    // `run_web` spawns `run_connection` and actually connects to SPICE.
+    //
+    // The GUI is the one mode that keeps a Proxmox source unresolved
+    // here: its launcher shows the login and VM list, so the Config only
+    // exists after the user picks a guest. Every other mode resolves it
+    // now and proceeds through the ordinary single-Config path.
+    let saved_gui = gui_mode && no_explicit_source && saved_proxmox.is_some();
+    let proxmox_gui = gui_mode && (crate::proxmox::requested(&args) || saved_gui);
+    let config: Option<Config> = if crate::proxmox::requested(&args) {
+        if proxmox_gui {
+            None
+        } else {
+            Some(crate::proxmox::resolve_session(&args, saved_proxmox)?)
+        }
+    } else if saved_gui {
+        None
+    } else {
+        Some(Config::from_args(&args)?)
+    };
+
+    if let Some(config) = &config {
+        // Built here for the log line and the capture metadata below;
+        // `run_headless` / `run_web` / `run_gui` each build their own
+        // from the `config` they take by value. `config.into()` borrows,
+        // so this doesn't consume it.
+        let startup_connection_config: shakenfist_spice_protocol::ConnectionConfig = config.into();
+        info!(
+            "Connecting to {} (TLS: {})",
+            startup_connection_config.display_target(),
+            config.tls_port.is_some()
+        );
+    }
     match args.h264_offer() {
         H264Offer::Preferred => {
             warn!("Preferring H.264 video; spice-server's does not decode yet, see ryll#398")
@@ -310,15 +363,21 @@ fn main() -> Result<()> {
     // Parse shared directory config (validates path early)
     let share_dir = parse_share_dir(&args)?;
 
-    // Create capture session if requested
+    // Create the capture session if requested and the source is already
+    // resolved. A Proxmox GUI launch creates it once the user picks a
+    // guest (the capture directory is named for that guest), so it is
+    // deliberately `None` here for that path.
     #[cfg(feature = "capture")]
-    let capture = match &args.capture {
-        Some(dir) => Some(Arc::new(CaptureSession::new(
-            std::path::PathBuf::from(dir),
-            &startup_connection_config.display_target(),
-            config.tls_port,
-        )?)),
-        None => None,
+    let capture = match (&args.capture, config.as_ref()) {
+        (Some(dir), Some(config)) => {
+            let connection_config: shakenfist_spice_protocol::ConnectionConfig = config.into();
+            Some(Arc::new(CaptureSession::new(
+                std::path::PathBuf::from(dir),
+                &connection_config.display_target(),
+                config.tls_port,
+            )?))
+        }
+        _ => None,
     };
     #[cfg(not(feature = "capture"))]
     let capture: Option<Arc<CaptureSession>> = None;
@@ -356,7 +415,7 @@ fn main() -> Result<()> {
         #[cfg(feature = "rdp")]
         {
             rdp::run_rdp(
-                config,
+                require_config(config)?,
                 &args,
                 virtual_disks,
                 share_dir,
@@ -371,7 +430,7 @@ fn main() -> Result<()> {
         }
     } else if args.web {
         run_web(
-            config,
+            require_config(config)?,
             &args,
             virtual_disks,
             share_dir,
@@ -381,7 +440,7 @@ fn main() -> Result<()> {
         )
     } else if args.headless {
         run_headless(
-            config,
+            require_config(config)?,
             &args,
             virtual_disks,
             share_dir,
@@ -392,15 +451,25 @@ fn main() -> Result<()> {
     } else {
         #[cfg(feature = "gui")]
         {
-            run_gui(
-                config,
-                &args,
-                virtual_disks,
-                share_dir,
-                capture,
-                pedantic_config,
-                obey_guest_size,
-            )
+            match config {
+                Some(config) => run_gui(
+                    config,
+                    &args,
+                    virtual_disks,
+                    share_dir,
+                    capture,
+                    pedantic_config,
+                    obey_guest_size,
+                ),
+                None => run_gui_proxmox(
+                    &args,
+                    virtual_disks,
+                    share_dir,
+                    pedantic_config,
+                    obey_guest_size,
+                    saved_proxmox.cloned(),
+                ),
+            }
         }
         #[cfg(not(feature = "gui"))]
         {
@@ -419,6 +488,18 @@ fn main() -> Result<()> {
             );
         }
     }
+}
+
+/// The non-GUI modes cannot represent an unresolved Proxmox source; the
+/// startup path resolves it before dispatching, so this only fires if a
+/// future mode forgets to.
+fn require_config(config: Option<Config>) -> Result<Config> {
+    config.ok_or_else(|| {
+        anyhow::anyhow!(
+            "this mode needs a resolved connection source; \
+             --proxmox is only interactive in the GUI"
+        )
+    })
 }
 
 fn run_headless(
@@ -1074,6 +1155,33 @@ fn run_web(
 }
 
 #[cfg(feature = "gui")]
+fn gui_native_options() -> eframe::NativeOptions {
+    eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([800.0, 600.0])
+            .with_resizable(true),
+        ..Default::default()
+    }
+}
+
+/// Wait for a capture session's writers, so the MP4 has its moov atom.
+///
+/// The session owns one `Arc`, but its connection thread is detached and
+/// may outlive `run_native`; the slot is the other handle, published by
+/// `RyllRoot` whether the capture was created here or (for a Proxmox
+/// launch) after the user picked a guest.
+#[cfg(feature = "gui")]
+fn finish_gui(
+    result: Result<(), anyhow::Error>,
+    capture_slot: Arc<std::sync::Mutex<Option<Arc<CaptureSession>>>>,
+) -> Result<()> {
+    if let Some(capture) = capture_slot.lock().expect("capture slot poisoned").take() {
+        capture.close_and_wait();
+    }
+    result
+}
+
+#[cfg(feature = "gui")]
 fn run_gui(
     config: Config,
     args: &Args,
@@ -1085,28 +1193,14 @@ fn run_gui(
 ) -> Result<()> {
     info!("Starting GUI");
 
-    let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([800.0, 600.0])
-            .with_resizable(true),
-        ..Default::default()
-    };
-
-    let cadence = args.cadence;
-    let monitors = args.monitors;
-    // `--paste-text` requires `--headless`, so it never reaches here.
-    let enable_paste = args.enable_paste_as_keystrokes;
-    let paste_char_delay_ms = args.paste_char_delay_ms;
-    let bug_report_dir = args.bug_report_dir.clone();
-    let debug_single_thread_runtime = args.debug_single_thread_runtime;
-    let auto_snapshot_interval = args.auto_snapshot_interval;
-    let auto_snapshot_cap = args.auto_snapshot_cap;
-    let h264 = args.h264_offer();
-    let image_cache_cap_bytes = mib_to_usize_bytes(args.image_cache_cap_mib);
-    let glz_dictionary_cap_bytes = mib_to_usize_bytes(args.glz_dictionary_cap_mib);
-    let preferred_compression = args.preferred_compression.wire_value();
-
-    if let Some(interval) = auto_snapshot_interval {
+    let setup = app::SessionSetup::from_args(
+        args,
+        virtual_disks,
+        share_dir,
+        pedantic_config,
+        obey_guest_size,
+    );
+    if let Some(interval) = args.auto_snapshot_interval {
         if interval < 10 {
             tracing::warn!(
                 "auto-snapshot: --auto-snapshot-interval {} is below the recommended \
@@ -1117,45 +1211,91 @@ fn run_gui(
         }
     }
 
-    // The app's connection threads are detached and each holds a
-    // clone of the capture session, so the last `Arc` can outlive
-    // `run_native`. Keep one here to wait on the writers explicitly.
-    let capture_for_exit = capture.clone();
+    let capture_slot = Arc::new(std::sync::Mutex::new(capture.clone()));
+    let slot_for_exit = capture_slot.clone();
 
     let result = eframe::run_native(
         "Ryll - SPICE Client",
-        native_options,
+        gui_native_options(),
         Box::new(move |cc| {
-            Ok(Box::new(app::RyllApp::new(
-                cc,
+            Ok(Box::new(app::RyllRoot::with_session(
+                &cc.egui_ctx,
+                setup,
                 config,
-                cadence,
-                enable_paste,
-                paste_char_delay_ms,
-                virtual_disks,
-                share_dir,
                 capture,
-                monitors,
-                pedantic_config,
-                bug_report_dir,
-                obey_guest_size,
-                debug_single_thread_runtime,
-                auto_snapshot_interval,
-                auto_snapshot_cap,
-                h264,
-                image_cache_cap_bytes,
-                glz_dictionary_cap_bytes,
-                preferred_compression,
+                capture_slot,
             )))
         }),
     )
     .map_err(|e| anyhow::anyhow!("eframe error: {}", e));
 
-    if let Some(ref capture) = capture_for_exit {
-        capture.close_and_wait();
+    finish_gui(result, slot_for_exit)
+}
+
+/// A GUI launch that begins at the Proxmox login and VM picker.
+#[cfg(feature = "gui")]
+fn run_gui_proxmox(
+    args: &Args,
+    virtual_disks: Vec<VirtualDiskConfig>,
+    share_dir: Option<ShareDirConfig>,
+    pedantic_config: Option<PedanticConfig>,
+    obey_guest_size: bool,
+    saved: Option<crate::config_dir::SavedProxmox>,
+) -> Result<()> {
+    info!("Starting GUI (Proxmox)");
+
+    let settings = crate::proxmox::ProxmoxLaunchSettings::from_args(args, saved.as_ref())?
+        .ok_or_else(|| anyhow::anyhow!("--proxmox is required"))?;
+
+    let setup = app::SessionSetup::from_args(
+        args,
+        virtual_disks,
+        share_dir,
+        pedantic_config,
+        obey_guest_size,
+    );
+    if let Some(interval) = args.auto_snapshot_interval {
+        if interval < 10 {
+            tracing::warn!(
+                "auto-snapshot: --auto-snapshot-interval {} is below the recommended \
+                 minimum of 10 s (BugReport::new samples metrics for ~2 s; \
+                 shorter intervals cause overlapping samples)",
+                interval
+            );
+        }
     }
 
-    result
+    // A Proxmox launch creates the capture session only after the guest
+    // is known, because the capture metadata names that guest.
+    let capture_dir = gui_capture_dir(args);
+    let capture_slot = Arc::new(std::sync::Mutex::new(None));
+    let slot_for_exit = capture_slot.clone();
+
+    let result = eframe::run_native(
+        "Ryll - SPICE Client",
+        gui_native_options(),
+        Box::new(move |_cc| {
+            Ok(Box::new(app::RyllRoot::with_proxmox(
+                setup,
+                settings,
+                capture_dir,
+                capture_slot,
+            )))
+        }),
+    )
+    .map_err(|e| anyhow::anyhow!("eframe error: {}", e));
+
+    finish_gui(result, slot_for_exit)
+}
+
+#[cfg(all(feature = "gui", feature = "capture"))]
+fn gui_capture_dir(args: &Args) -> Option<std::path::PathBuf> {
+    args.capture.clone().map(std::path::PathBuf::from)
+}
+
+#[cfg(all(feature = "gui", not(feature = "capture")))]
+fn gui_capture_dir(_args: &Args) -> Option<std::path::PathBuf> {
+    None
 }
 
 /// The tracing directive a session logs under.

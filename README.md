@@ -24,6 +24,11 @@ installing software.
   playback, USB redirection, and WebDAV folder sharing channels, with
   LZ / GLZ / LZ4 / JPEG / QUIC image decompression and hardware-accelerated
   MJPEG streaming.
+- Proxmox VE as a connection source: log in with a password or API
+  token, pick from the QEMU guests the login can see, and connect to a
+  running guest's SPICE console. An endpoint and API token can be saved
+  in `~/.ryll/config.json` (mode 0600); passwords are never stored. See
+  [docs/proxmox.md](https://github.com/shakenfist/ryll/blob/develop/docs/proxmox.md).
 - Built for automation and testing: headless and cadence modes, latency and bandwidth
   instrumentation, per-channel pcap capture, and a Unix-socket control
   interface for driving sessions from external tools.
@@ -65,6 +70,9 @@ ryll --file /path/to/connection.vv
 
 # Direct connection (host:port, or host:port:tls-port)
 ryll --direct 192.168.1.100:5900
+
+# Proxmox VE: log in, then pick a guest in the GUI (or pass --proxmox-vm)
+ryll --proxmox https://pve.example:8006
 
 # Headless latency probe
 ryll --file connection.vv --headless --cadence

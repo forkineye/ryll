@@ -32,7 +32,7 @@ use serde::Deserialize;
 use url::Url;
 
 use crate::config::{read_secret_file, Args, Config};
-use crate::config_dir::{self, SavedProxmox};
+use crate::config_dir::{self, ProxmoxProfile, SavedProxmox};
 
 /// The port the Proxmox VE web/API daemon listens on by default. A URL
 /// with no explicit port gets this one, so `--proxmox pve.example` works
@@ -98,10 +98,10 @@ impl ProxmoxVm {
         self.status.as_deref() == Some("running")
     }
 
-    /// Whether the guest can be given a console. Templates and stopped
-    /// guests are listed (the user can see them) but cannot be connected
-    /// to. Only the GUI picker disables their button; the non-GUI path
-    /// reports the same condition in `spice_config`.
+    /// Whether the guest can be given a console. A stopped guest is
+    /// listed with its button disabled; templates are filtered out of
+    /// the GUI picker entirely because Proxmox cannot mint a console for
+    /// them. The non-GUI path reports both conditions in `spice_config`.
     #[cfg_attr(not(feature = "gui"), allow(dead_code))]
     pub fn is_connectable(&self) -> bool {
         self.is_running() && !self.template
@@ -182,12 +182,29 @@ impl ProxmoxClient {
     /// Proxmox version or proxy that does not expose the per-node index
     /// usefully. LXC containers are excluded because they have no SPICE
     /// console.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
     pub fn list_vms(&self) -> Result<Vec<ProxmoxVm>> {
+        self.list_inventory().map(|(vms, _nodes)| vms)
+    }
+
+    /// List the visible VMs and the node names that were consulted.
+    ///
+    /// The GUI names a saved profile after the node it connected to, so
+    /// it needs the node list that `list_vms` throws away.
+    pub fn list_inventory(&self) -> Result<(Vec<ProxmoxVm>, Vec<String>)> {
         match self.list_vms_per_node() {
-            Ok(vms) if !vms.is_empty() => Ok(vms),
-            Ok(per_node_empty) => match self.list_vms_from_resources() {
-                Ok(resource_vms) if !resource_vms.is_empty() => Ok(resource_vms),
-                Ok(_) => Ok(per_node_empty),
+            Ok((vms, nodes)) if !vms.is_empty() => Ok((vms, nodes)),
+            Ok((per_node_empty, nodes)) => match self.list_vms_from_resources() {
+                Ok(resource_vms) if !resource_vms.is_empty() => {
+                    let resource_nodes = Self::node_names_from_vms(&resource_vms);
+                    let nodes = if resource_nodes.is_empty() {
+                        nodes
+                    } else {
+                        resource_nodes
+                    };
+                    Ok((resource_vms, nodes))
+                }
+                Ok(_) => Ok((per_node_empty, nodes)),
                 Err(error) => {
                     // The per-node path succeeded, so an empty result is
                     // authoritative; a failure of the optional fallback
@@ -195,11 +212,14 @@ impl ProxmoxClient {
                     tracing::debug!(
                         "Proxmox: cluster-resource fallback failed after an empty per-node list: {error:#}"
                     );
-                    Ok(per_node_empty)
+                    Ok((per_node_empty, nodes))
                 }
             },
             Err(per_node_error) => match self.list_vms_from_resources() {
-                Ok(vms) => Ok(vms),
+                Ok(vms) => {
+                    let nodes = Self::node_names_from_vms(&vms);
+                    Ok((vms, nodes))
+                }
                 Err(resource_error) => Err(anyhow!(
                     "could not list Proxmox VMs: per-node index: {per_node_error:#}; \
                      cluster resources: {resource_error:#}"
@@ -208,20 +228,38 @@ impl ProxmoxClient {
         }
     }
 
+    /// The Proxmox node name to label a saved profile with.
+    ///
+    /// Prefer a node whose name matches the API host or its first DNS
+    /// label, then the first node the server listed, and finally the
+    /// host itself. A cluster can serve its API from any member, so the
+    /// match is a heuristic; it is exact for the standalone hosts most
+    /// profiles use.
+    pub fn server_node_name(&self, nodes: &[String]) -> String {
+        let host = self.base.host_str().unwrap_or_default();
+        let short = host.split('.').next().unwrap_or(host);
+        nodes
+            .iter()
+            .find(|node| node.as_str() == host || node.as_str() == short)
+            .cloned()
+            .or_else(|| nodes.first().cloned())
+            .unwrap_or_else(|| short.to_string())
+    }
+
     /// Walk `/nodes/{node}/qemu` on every node.
     ///
     /// A node that cannot be reached is skipped so one offline or
     /// restricted node does not hide the VMs on the others. The error is
     /// returned only when no node produced a usable answer, which lets
     /// `list_vms` try the cluster-resource fallback.
-    fn list_vms_per_node(&self) -> Result<Vec<ProxmoxVm>> {
+    fn list_vms_per_node(&self) -> Result<(Vec<ProxmoxVm>, Vec<String>)> {
         let nodes = self.list_node_names()?;
         let mut vms = Vec::new();
         let mut successful_nodes = 0usize;
         let mut first_error: Option<(String, anyhow::Error)> = None;
 
-        for node in nodes {
-            match self.list_node_vms(&node) {
+        for node in &nodes {
+            match self.list_node_vms(node) {
                 Ok(mut node_vms) => {
                     successful_nodes += 1;
                     vms.append(&mut node_vms);
@@ -229,7 +267,7 @@ impl ProxmoxClient {
                 Err(error) => {
                     tracing::debug!("Proxmox: could not list VMs on node {node}: {error:#}");
                     if first_error.is_none() {
-                        first_error = Some((node, error));
+                        first_error = Some((node.clone(), error));
                     }
                 }
             }
@@ -240,7 +278,7 @@ impl ProxmoxClient {
                 return Err(error).with_context(|| format!("could not list VMs on node {node}"));
             }
             // No nodes were returned. Let the caller try the fallback.
-            return Ok(Vec::new());
+            return Ok((Vec::new(), nodes));
         }
 
         // VMIDs are cluster-unique, but a proxy or a future API quirk
@@ -251,7 +289,7 @@ impl ProxmoxClient {
         }
         let mut vms: Vec<ProxmoxVm> = by_vmid.into_values().collect();
         vms.sort_by(|a, b| a.node.cmp(&b.node).then(a.vmid.cmp(&b.vmid)));
-        Ok(vms)
+        Ok((vms, nodes))
     }
 
     fn list_node_names(&self) -> Result<Vec<String>> {
@@ -340,6 +378,15 @@ impl ProxmoxClient {
 
         vms.sort_by(|a, b| a.node.cmp(&b.node).then(a.vmid.cmp(&b.vmid)));
         Ok(vms)
+    }
+
+    /// The unique node names named by a VM list, for the cluster-resource
+    /// fallback where no `/nodes` answer was available.
+    fn node_names_from_vms(vms: &[ProxmoxVm]) -> Vec<String> {
+        let mut nodes: Vec<String> = vms.iter().map(|vm| vm.node.clone()).collect();
+        nodes.sort();
+        nodes.dedup();
+        nodes
     }
 
     /// Fetch the guest's `.vv` document and turn it into a [`Config`].
@@ -597,7 +644,11 @@ pub fn normalize_base_url(raw: &str) -> Result<Url> {
 /// Whether `raw` names a port explicitly, before `Url` normalises a
 /// default port away. IPv6 literals are bracketed, so only a colon
 /// outside the brackets is the port separator.
-fn has_explicit_port(raw: &str) -> bool {
+///
+/// The GUI's endpoint form keeps the URL and port in separate fields, so
+/// it uses this to reject a port pasted into the URL field rather than
+/// silently replacing it with the Port field's value.
+pub(crate) fn has_explicit_port(raw: &str) -> bool {
     let after_scheme = raw.split_once("://").map(|(_, rest)| rest).unwrap_or(raw);
     let authority = after_scheme
         .split(['/', '?', '#'])
@@ -707,17 +758,8 @@ pub fn auth_from_args(args: &Args) -> Result<Option<ProxmoxAuth>> {
     }
 }
 
-/// Whether `url` is the same Proxmox endpoint as `saved`.
-///
-/// Both sides are normalised first, so `pve.example`, `https://pve.example`
-/// and `https://pve.example:8006/` compare equal. A saved token is only
-/// reused with a matching endpoint: it must never be sent to a different
-/// server just because the user typed a different `--proxmox` URL.
-pub fn saved_url_matches(url: &str, saved: &SavedProxmox) -> bool {
-    endpoint_matches(url, &saved.url)
-}
-
 /// Whether two endpoint strings normalise to the same Proxmox URL.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
 pub fn endpoint_matches(left: &str, right: &str) -> bool {
     match (normalize_base_url(left), normalize_base_url(right)) {
         (Ok(left), Ok(right)) => left == right,
@@ -725,14 +767,86 @@ pub fn endpoint_matches(left: &str, right: &str) -> bool {
     }
 }
 
-/// The saved Proxmox section that applies to this command line, if any.
+/// The endpoint a profile describes, with its port applied.
+fn profile_endpoint(profile: &ProxmoxProfile) -> Option<Url> {
+    let mut endpoint = normalize_base_url(&profile.host).ok()?;
+    endpoint.set_port(Some(profile.port)).ok()?;
+    Some(endpoint)
+}
+
+/// Render an endpoint with its port kept explicit.
 ///
-/// This is only non-`None` when `--proxmox` is present and its endpoint
-/// matches the saved endpoint. The GUI's no-argument path handles the
-/// saved endpoint itself, so it does not need a `--proxmox` URL.
-fn saved_for_url<'a>(args: &Args, saved: Option<&'a SavedProxmox>) -> Option<&'a SavedProxmox> {
-    let url = args.proxmox.as_deref()?;
-    saved.filter(|saved| saved_url_matches(url, saved))
+/// `Url::to_string` omits a scheme-default port (`https` 443, `http` 80).
+/// A bare `https://host` is later read as Proxmox's 8006, so the port
+/// must stay visible in the string even when it is the scheme default.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub(crate) fn endpoint_with_port(mut endpoint: Url, port: u16) -> String {
+    let _ = endpoint.set_port(None);
+    let text = endpoint.to_string();
+    let authority_end = text
+        .find("://")
+        .map(|index| index + 3)
+        .and_then(|start| text[start..].find('/').map(|index| start + index))
+        .unwrap_or(text.len());
+    let (origin, path) = text.split_at(authority_end);
+    let path = if path == "/" { "" } else { path };
+    format!("{origin}:{port}{path}")
+}
+
+/// The profile endpoint as a display/comparison string, without a
+/// trailing slash.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub(crate) fn profile_endpoint_string(profile: &ProxmoxProfile) -> Option<String> {
+    let endpoint = profile_endpoint(profile)?;
+    Some(endpoint_with_port(endpoint, profile.port))
+}
+
+/// Whether `url` names the same endpoint as `profile`.
+fn profile_matches(url: &str, profile: &ProxmoxProfile) -> bool {
+    match (normalize_base_url(url), profile_endpoint(profile)) {
+        (Ok(url), Some(profile)) => url == profile,
+        _ => false,
+    }
+}
+
+/// Split an endpoint into the host URL (without its port) and the port,
+/// the shape a saved profile uses.
+pub(crate) fn endpoint_parts(raw: &str) -> Result<(String, u16)> {
+    let mut endpoint = normalize_base_url(raw)?;
+    let port = endpoint.port_or_known_default().unwrap_or(DEFAULT_PORT);
+    endpoint
+        .set_port(None)
+        .map_err(|_| anyhow!("the endpoint has no usable host"))?;
+    Ok((endpoint.to_string().trim_end_matches('/').to_string(), port))
+}
+
+/// The profile whose endpoint matches `url`.
+fn matching_profile<'a>(url: &str, saved: Option<&'a SavedProxmox>) -> Option<&'a ProxmoxProfile> {
+    saved?
+        .profiles
+        .iter()
+        .find(|profile| profile_matches(url, profile))
+}
+
+/// The URL named explicitly on the command line, if any.
+///
+/// `--proxmox` may be given without a value to open the GUI's connection
+/// form; an empty value asks for the form rather than naming an endpoint.
+fn requested_url(args: &Args) -> Option<&str> {
+    args.proxmox
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+}
+
+/// The saved profile that applies to this command line, if any.
+///
+/// Only an explicit, non-empty `--proxmox` URL can match a profile here.
+/// Bare `--proxmox` (the GUI form) chooses the saved endpoint in
+/// [`ProxmoxLaunchSettings::from_args`], not in the non-interactive
+/// credential paths.
+fn saved_for_url<'a>(args: &Args, saved: Option<&'a SavedProxmox>) -> Option<&'a ProxmoxProfile> {
+    matching_profile(requested_url(args)?, saved)
 }
 
 /// Whether the command line explicitly asked for password
@@ -754,10 +868,10 @@ pub fn auth_for_source(args: &Args, saved: Option<&SavedProxmox>) -> Result<Opti
     if cli_password_requested(args) {
         return Ok(None);
     }
-    let Some(saved) = saved_for_url(args, saved) else {
+    let Some(profile) = saved_for_url(args, saved) else {
         return Ok(None);
     };
-    let Some(token) = saved.token.as_deref() else {
+    let Some(token) = profile.token.as_deref() else {
         return Ok(None);
     };
     Ok(Some(ProxmoxAuth::Token {
@@ -777,32 +891,34 @@ pub fn tls_from_args(args: &Args) -> Result<ProxmoxTls> {
     })
 }
 
-/// Build TLS settings from a saved Proxmox section.
-fn tls_from_saved(saved: &SavedProxmox) -> Result<ProxmoxTls> {
-    if saved.insecure && saved.ca.is_some() {
+/// TLS settings for a saved profile.
+pub(crate) fn tls_from_profile(profile: &ProxmoxProfile) -> Result<ProxmoxTls> {
+    if profile.insecure && profile.ca.is_some() {
         bail!(
-            "the saved Proxmox configuration under ~/.ryll sets both `insecure` and `ca`; \
-             remove one from config.json"
+            "the saved Proxmox profile for {}:{} sets both `insecure` and `ca`; \
+             remove one from config.json",
+            profile.host,
+            profile.port
         );
     }
-    let ca_pem = match &saved.ca {
+    let ca_pem = match &profile.ca {
         Some(path) => Some(read_ca_file(path, "saved Proxmox CA")?),
         None => None,
     };
     Ok(ProxmoxTls {
-        insecure: saved.insecure,
+        insecure: profile.insecure,
         ca_pem,
     })
 }
 
 /// TLS settings for a command-line session, using the CLI flags first and
-/// then a saved section with the same endpoint.
+/// then the saved profile with the same endpoint.
 pub fn tls_for_source(args: &Args, saved: Option<&SavedProxmox>) -> Result<ProxmoxTls> {
     if args.proxmox_insecure || args.proxmox_ca.is_some() {
         return tls_from_args(args);
     }
-    if let Some(saved) = saved_for_url(args, saved) {
-        return tls_from_saved(saved);
+    if let Some(profile) = saved_for_url(args, saved) {
+        return tls_from_profile(profile);
     }
     tls_from_args(args)
 }
@@ -815,13 +931,21 @@ fn read_ca_file(path: &Path, label: &str) -> Result<Vec<u8>> {
 /// already handles the mechanical conflicts) and enforce the extra
 /// requirements of the non-interactive modes.
 pub fn validate_args(args: &Args, saved: Option<&SavedProxmox>) -> Result<()> {
-    // A saved section with no `--proxmox` is the GUI's no-argument path:
-    // there is nothing to validate until the user decides to connect.
-    if !requested(args) && saved.is_none() {
+    // No Proxmox source: there is nothing to validate.
+    if !requested(args) {
         return Ok(());
     }
     if args.proxmox_insecure && args.proxmox_ca.is_some() {
         bail!("--proxmox-insecure and --proxmox-ca cannot be used together");
+    }
+
+    // The GUI form can collect the URL after launch; every other path
+    // (including --proxmox-list) needs it now. Bare `--proxmox` without a
+    // saved endpoint still opens the GUI, so only reject the missing URL
+    // when there is no form to fill in.
+    let interactive_gui = !args.headless && !args.web && !args.rdp;
+    if requested_url(args).is_none() && (!interactive_gui || args.proxmox_list) {
+        bail!("--proxmox needs a URL, such as https://pve.example:8006");
     }
 
     // auth_for_source also reads any secret file, so a missing or empty
@@ -839,7 +963,6 @@ pub fn validate_args(args: &Args, saved: Option<&SavedProxmox>) -> Result<()> {
         return Ok(());
     }
 
-    let interactive_gui = !args.headless && !args.web && !args.rdp;
     if !interactive_gui {
         if auth.is_none() {
             bail!(
@@ -903,10 +1026,9 @@ fn connect_and_list(
     args: &Args,
     saved: Option<&SavedProxmox>,
 ) -> Result<(ProxmoxClient, Vec<ProxmoxVm>)> {
-    let url = args
-        .proxmox
-        .as_deref()
-        .ok_or_else(|| anyhow!("--proxmox is required"))?;
+    let url = requested_url(args).ok_or_else(|| {
+        anyhow!("--proxmox needs a URL outside the GUI, such as https://pve.example:8006")
+    })?;
     let auth = auth_for_source(args, saved)?.ok_or_else(|| {
         anyhow!(
             "--proxmox needs credentials: pass --proxmox-user with a password, \
@@ -918,12 +1040,7 @@ fn connect_and_list(
     let token_to_save = if args.proxmox_save {
         match &auth {
             ProxmoxAuth::Token { token } => Some(token.clone()),
-            ProxmoxAuth::Password { .. } => {
-                tracing::warn!(
-                    "--proxmox-save stores only API tokens; this password login was not saved"
-                );
-                None
-            }
+            ProxmoxAuth::Password { .. } => None,
         }
     } else {
         None
@@ -931,17 +1048,23 @@ fn connect_and_list(
 
     tracing::debug!("Proxmox: authenticating with {}", auth.method_name());
     let client = ProxmoxClient::connect(url, auth, tls, args.proxmox_proxy.clone())?;
-    let vms = client.list_vms()?;
+    let (vms, nodes) = client.list_inventory()?;
 
-    if let Some(token) = token_to_save {
-        let saved_config = saved_config_for_save(args, saved, token);
-        match config_dir::save_proxmox(&saved_config) {
-            Ok(path) => tracing::info!(
-                "Proxmox: saved endpoint and API token in {}",
+    if args.proxmox_save {
+        if token_to_save.is_none() {
+            tracing::warn!(
+                "--proxmox-save stores only API tokens; saving the endpoint without a token"
+            );
+        }
+        let profile = profile_for_save(args, saved, token_to_save, &nodes, &client);
+        match config_dir::upsert_proxmox_profile(&profile) {
+            Ok((path, _)) => tracing::info!(
+                "Proxmox: saved profile '{}' in {}",
+                profile.name,
                 path.display()
             ),
             Err(error) => {
-                tracing::warn!("Proxmox: could not save the endpoint and token: {error:#}")
+                tracing::warn!("Proxmox: could not save the profile: {error:#}")
             }
         }
     }
@@ -949,26 +1072,33 @@ fn connect_and_list(
     Ok((client, vms))
 }
 
-/// Build the persisted shape for `--proxmox-save`, preserving any
-/// existing auto-connect choice and the TLS settings in force.
-fn saved_config_for_save(args: &Args, saved: Option<&SavedProxmox>, token: String) -> SavedProxmox {
-    let url = args.proxmox.clone().unwrap_or_default();
-    let matching = saved.filter(|saved| saved_url_matches(&url, saved));
-
+/// Build the profile `--proxmox-save` writes, preserving the TLS settings
+/// in force.
+fn profile_for_save(
+    args: &Args,
+    saved: Option<&SavedProxmox>,
+    token: Option<String>,
+    nodes: &[String],
+    client: &ProxmoxClient,
+) -> ProxmoxProfile {
+    let url = requested_url(args).unwrap_or_default();
+    let (host, port) = endpoint_parts(url).unwrap_or_else(|_| (url.to_string(), DEFAULT_PORT));
+    let matching = matching_profile(url, saved);
     let (insecure, ca) = if args.proxmox_insecure || args.proxmox_ca.is_some() {
         (args.proxmox_insecure, args.proxmox_ca.clone())
-    } else if let Some(saved) = matching {
-        (saved.insecure, saved.ca.clone())
+    } else if let Some(profile) = matching {
+        (profile.insecure, profile.ca.clone())
     } else {
         (false, None)
     };
 
-    SavedProxmox {
-        url,
-        token: Some(token),
+    ProxmoxProfile {
+        name: client.server_node_name(nodes),
+        host,
+        port,
+        token,
         insecure,
         ca,
-        auto_connect: matching.map(|saved| saved.auto_connect).unwrap_or(false),
     }
 }
 
@@ -998,6 +1128,11 @@ pub fn format_vm_table(vms: &[ProxmoxVm]) -> String {
 #[derive(Clone)]
 pub struct ProxmoxLaunchSettings {
     pub url: String,
+    /// Every saved profile, for the form's profile picker.
+    pub profiles: Vec<ProxmoxProfile>,
+    /// The profile the form starts on: the matching one for an explicit
+    /// URL, or the most recent one for a bare `--proxmox`.
+    pub selected_profile: Option<usize>,
     pub username: String,
     pub password: Option<String>,
     pub token: Option<String>,
@@ -1005,11 +1140,6 @@ pub struct ProxmoxLaunchSettings {
     pub ca_path: Option<std::path::PathBuf>,
     pub proxy: Option<String>,
     pub auto_vm: Option<u32>,
-    /// Show the "use the saved connection?" screen before the login form.
-    pub prompt_saved: bool,
-    /// The saved auto-connect preference. Preserved when the launcher
-    /// rewrites the token.
-    pub auto_connect: bool,
     /// `--proxmox-save`: after a successful token login, persist without
     /// requiring the Remember checkbox.
     pub save_requested: bool,
@@ -1029,16 +1159,32 @@ impl ProxmoxLaunchSettings {
     /// Proxmox launch.
     ///
     /// `saved` is the Proxmox section loaded from `~/.ryll`, if any.
-    /// Without an explicit `--proxmox`, it supplies the endpoint and
-    /// token. With one, it is only consulted when the endpoint matches,
+    /// For a bare `--proxmox` it supplies the most recent profile; for
+    /// an explicit URL it is only consulted when the endpoint matches,
     /// so a saved token is never sent to a different server.
     pub fn from_args(args: &Args, saved: Option<&SavedProxmox>) -> Result<Option<Self>> {
-        let url = args
-            .proxmox
-            .clone()
-            .or_else(|| saved.map(|saved| saved.url.clone()))
-            .ok_or_else(|| anyhow!("--proxmox is required"))?;
-        let matching_saved = saved.filter(|saved| saved_url_matches(&url, saved));
+        if args.proxmox.is_none() {
+            return Ok(None);
+        }
+        let profiles: Vec<ProxmoxProfile> = saved
+            .map(|saved| saved.profiles.clone())
+            .unwrap_or_default();
+        let explicit_url = requested_url(args);
+        let selected_profile = match explicit_url {
+            Some(url) => profiles
+                .iter()
+                .position(|profile| profile_matches(url, profile)),
+            None => (!profiles.is_empty()).then_some(0),
+        };
+        let chosen = selected_profile.map(|index| &profiles[index]);
+        // Bare `--proxmox` names no endpoint: use the saved profile when
+        // one exists, otherwise start the form with an empty URL for the
+        // user to fill in.
+        let url = match explicit_url {
+            Some(url) => url.to_string(),
+            None => chosen.and_then(profile_endpoint_string).unwrap_or_default(),
+        };
+        let matching_saved = chosen.filter(|profile| profile_matches(&url, profile));
 
         let cli_token = match (&args.proxmox_token, &args.proxmox_token_file) {
             (Some(token), None) => Some(token.clone()),
@@ -1052,7 +1198,7 @@ impl ProxmoxLaunchSettings {
         let token = match cli_token {
             Some(token) => Some(normalize_token(&token)?),
             None if cli_password_requested(args) => None,
-            None => match matching_saved.and_then(|saved| saved.token.as_deref()) {
+            None => match matching_saved.and_then(|profile| profile.token.as_deref()) {
                 Some(token) => Some(normalize_token(token)?),
                 None => None,
             },
@@ -1069,27 +1215,21 @@ impl ProxmoxLaunchSettings {
 
         let (tls, ca_path) = if args.proxmox_insecure || args.proxmox_ca.is_some() {
             (tls_from_args(args)?, args.proxmox_ca.clone())
-        } else if let Some(saved) = matching_saved {
-            (tls_from_saved(saved)?, saved.ca.clone())
+        } else if let Some(profile) = matching_saved {
+            (tls_from_profile(profile)?, profile.ca.clone())
         } else {
             (tls_from_args(args)?, args.proxmox_ca.clone())
         };
 
-        let auto_connect = matching_saved
-            .map(|saved| saved.auto_connect)
-            .unwrap_or(false);
         let saved_token_present = matching_saved
-            .and_then(|saved| saved.token.as_ref())
+            .and_then(|profile| profile.token.as_ref())
             .is_some();
-        // Confirm the use of a saved token in the GUI unless the user
-        // opted into automatic connection. Explicit command-line
-        // credentials are already the user's instruction and are never
-        // prompted for.
-        let prompt_saved =
-            !cli_explicit_auth && token.is_some() && saved_token_present && !auto_connect;
+        let saved_url = matching_saved.and_then(profile_endpoint_string);
 
         Ok(Some(Self {
             url,
+            profiles,
+            selected_profile,
             username: args.proxmox_user.clone().unwrap_or_default(),
             password,
             token,
@@ -1097,19 +1237,26 @@ impl ProxmoxLaunchSettings {
             ca_path,
             proxy: args.proxmox_proxy.clone(),
             auto_vm: args.proxmox_vm,
-            prompt_saved,
-            auto_connect,
             save_requested: args.proxmox_save,
             saved_token_present,
             token_from_saved: saved_token_present && !cli_explicit_auth,
-            saved_url: matching_saved.map(|saved| saved.url.clone()),
+            saved_url,
         }))
     }
 
-    /// Whether the flags supplied enough to log in without the user
-    /// touching the form.
+    /// Whether the settings can log in without the user touching the
+    /// form: only explicit command-line credentials qualify.
+    ///
+    /// A token loaded from a saved profile always leaves the form up,
+    /// prefilled and ready for the user to press **Connect**. Ryll never
+    /// connects to a saved Proxmox profile automatically.
     pub fn can_auto_login(&self) -> bool {
-        self.token.is_some() || (!self.username.trim().is_empty() && self.password.is_some())
+        if self.url.trim().is_empty() {
+            return false;
+        }
+        let credentials =
+            self.token.is_some() || (!self.username.trim().is_empty() && self.password.is_some());
+        credentials && !self.token_from_saved
     }
 
     /// Split a normalised token into the token ID and secret the login
@@ -1424,6 +1571,8 @@ mod tests {
     fn launch_settings_split_token_for_the_form() {
         let settings = ProxmoxLaunchSettings {
             url: "https://pve.example:8006".to_string(),
+            profiles: Vec::new(),
+            selected_profile: None,
             username: String::new(),
             password: None,
             token: Some("root@pam!ryll=secret".to_string()),
@@ -1431,8 +1580,6 @@ mod tests {
             ca_path: None,
             proxy: None,
             auto_vm: None,
-            prompt_saved: false,
-            auto_connect: false,
             save_requested: false,
             saved_token_present: false,
             token_from_saved: false,
@@ -1657,28 +1804,80 @@ mod tests {
         server.join().expect("mock server");
     }
 
-    fn saved_proxmox(url: &str, auto_connect: bool) -> SavedProxmox {
-        SavedProxmox {
-            url: url.to_string(),
-            token: Some("root@pam!ryll=secret".to_string()),
+    fn profile(name: &str, host: &str, port: u16, token: Option<&str>) -> ProxmoxProfile {
+        ProxmoxProfile {
+            name: name.to_string(),
+            host: host.to_string(),
+            port,
+            token: token.map(str::to_string),
             insecure: false,
             ca: None,
-            auto_connect,
         }
     }
 
-    #[test]
-    fn saved_url_matching_normalises_the_endpoint() {
-        let saved = saved_proxmox("https://pve.example:8006", false);
-        assert!(saved_url_matches("pve.example", &saved));
-        assert!(saved_url_matches("https://pve.example:8006/", &saved));
-        assert!(!saved_url_matches("https://other.example:8006", &saved));
+    fn saved(profiles: Vec<ProxmoxProfile>) -> SavedProxmox {
+        SavedProxmox { profiles }
+    }
+
+    fn saved_proxmox(host: &str, port: u16) -> SavedProxmox {
+        saved(vec![profile(
+            "pve1",
+            host,
+            port,
+            Some("root@pam!ryll=secret"),
+        )])
     }
 
     #[test]
-    fn a_saved_token_is_used_only_for_the_saved_endpoint() {
+    fn scheme_default_ports_survive_endpoint_strings() {
+        let profile = profile("pve", "https://pve.example", 443, None);
+        assert_eq!(
+            profile_endpoint_string(&profile).as_deref(),
+            Some("https://pve.example:443")
+        );
+        assert!(profile_matches("https://pve.example:443", &profile));
+        assert!(!profile_matches("https://pve.example", &profile));
+        assert!(endpoint_matches(
+            "https://pve.example:443",
+            "https://pve.example:443"
+        ));
+        assert!(!endpoint_matches(
+            "https://pve.example:443",
+            "https://pve.example"
+        ));
+    }
+
+    #[test]
+    fn profile_matching_normalises_the_endpoint() {
+        let saved = saved_proxmox("https://pve.example", 8006);
+        let profile = &saved.profiles[0];
+        assert!(profile_matches("pve.example", profile));
+        assert!(profile_matches("https://pve.example:8006/", profile));
+        assert!(profile_matches("https://pve.example", profile));
+        assert!(!profile_matches("https://other.example:8006", profile));
+        assert!(!profile_matches("https://pve.example:8443", profile));
+    }
+
+    #[test]
+    fn endpoint_parts_splits_the_host_and_port() {
+        assert_eq!(
+            endpoint_parts("https://pve.example:8443").expect("endpoint"),
+            ("https://pve.example".to_string(), 8443)
+        );
+        assert_eq!(
+            endpoint_parts("https://pve.example").expect("endpoint"),
+            ("https://pve.example".to_string(), 8006)
+        );
+        assert_eq!(
+            endpoint_parts("pve.example").expect("endpoint"),
+            ("https://pve.example".to_string(), 8006)
+        );
+    }
+
+    #[test]
+    fn a_saved_token_is_used_only_for_its_host() {
         let args = Args::parse_from(["ryll", "--proxmox", "pve.example"]);
-        let saved = saved_proxmox("https://pve.example:8006", false);
+        let saved = saved_proxmox("https://pve.example", 8006);
         match auth_for_source(&args, Some(&saved))
             .expect("auth")
             .expect("saved token")
@@ -1689,11 +1888,56 @@ mod tests {
             ProxmoxAuth::Password { .. } => panic!("expected the saved token"),
         }
 
-        let other = saved_proxmox("https://other.example:8006", false);
+        // A profile for a different host must not answer for this one.
+        let other = saved_proxmox("https://other.example", 8006);
+        let same_host_other_port = Args::parse_from(["ryll", "--proxmox", "pve.example:8443"]);
+        assert!(auth_for_source(&same_host_other_port, Some(&saved))
+            .expect("auth")
+            .is_none());
         assert!(auth_for_source(&args, Some(&other))
             .expect("auth")
             .is_none());
         assert!(auth_for_source(&args, None).expect("auth").is_none());
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn matching_profile_is_chosen_among_several() {
+        let saved = saved(vec![
+            profile("pve1", "https://one.example", 8006, Some("a@pve!t=one")),
+            profile("pve2", "https://two.example", 8443, Some("b@pve!t=two")),
+        ]);
+        let args = Args::parse_from(["ryll", "--proxmox", "https://two.example:8443"]);
+        let settings = ProxmoxLaunchSettings::from_args(&args, Some(&saved))
+            .expect("settings")
+            .expect("proxmox settings");
+        assert_eq!(settings.url, "https://two.example:8443");
+        assert_eq!(settings.token.as_deref(), Some("b@pve!t=two"));
+        assert_eq!(settings.selected_profile, Some(1));
+        assert_eq!(
+            settings.saved_url.as_deref(),
+            Some("https://two.example:8443")
+        );
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn bare_proxmox_uses_the_most_recent_profile() {
+        let saved = saved(vec![
+            profile("pve1", "https://one.example", 8006, Some("a@pve!t=one")),
+            profile("pve2", "https://two.example", 8006, Some("b@pve!t=two")),
+        ]);
+        let args = Args::parse_from(["ryll", "--proxmox"]);
+        let settings = ProxmoxLaunchSettings::from_args(&args, Some(&saved))
+            .expect("settings")
+            .expect("proxmox settings");
+        assert_eq!(settings.url, "https://one.example:8006");
+        assert_eq!(settings.token.as_deref(), Some("a@pve!t=one"));
+        assert_eq!(settings.selected_profile, Some(0));
+        assert!(
+            !settings.can_auto_login(),
+            "a saved token must never log in without Connect"
+        );
     }
 
     #[test]
@@ -1706,67 +1950,128 @@ mod tests {
             "--proxmox-vm",
             "100",
         ]);
-        let saved = saved_proxmox("https://pve.example:8006", false);
+        let saved = saved_proxmox("https://pve.example", 8006);
         validate_args(&args, Some(&saved)).expect("saved token satisfies the requirement");
     }
 
     #[cfg(feature = "gui")]
     #[test]
-    fn launch_settings_prompt_for_a_saved_connection() {
-        let args = Args::parse_from(["ryll"]);
-        let saved = saved_proxmox("https://pve.example:8006", false);
+    fn launch_settings_prefill_a_saved_connection_without_auto_login() {
+        let args = Args::parse_from(["ryll", "--proxmox"]);
+        let saved = saved_proxmox("https://pve.example", 8006);
         let settings = ProxmoxLaunchSettings::from_args(&args, Some(&saved))
             .expect("settings")
             .expect("proxmox settings");
         assert_eq!(settings.url, "https://pve.example:8006");
         assert_eq!(settings.token.as_deref(), Some("root@pam!ryll=secret"));
-        assert!(settings.prompt_saved);
-        assert!(!settings.auto_connect);
         assert!(settings.saved_token_present);
-        assert!(settings.can_auto_login());
+        assert_eq!(settings.selected_profile, Some(0));
+        assert!(
+            !settings.can_auto_login(),
+            "a saved token always shows the prefilled form"
+        );
     }
 
     #[cfg(feature = "gui")]
     #[test]
-    fn launch_settings_skip_the_prompt_when_auto_connect_is_saved() {
+    fn launch_settings_require_the_proxmox_flag() {
         let args = Args::parse_from(["ryll"]);
-        let saved = saved_proxmox("https://pve.example:8006", true);
-        let settings = ProxmoxLaunchSettings::from_args(&args, Some(&saved))
+        let saved = saved_proxmox("https://pve.example", 8006);
+        assert!(
+            ProxmoxLaunchSettings::from_args(&args, Some(&saved))
+                .expect("settings")
+                .is_none(),
+            "a bare launch must not adopt a saved connection"
+        );
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn bare_proxmox_opens_an_empty_form_without_a_saved_endpoint() {
+        let args = Args::parse_from(["ryll", "--proxmox"]);
+        let settings = ProxmoxLaunchSettings::from_args(&args, None)
             .expect("settings")
             .expect("proxmox settings");
-        assert!(!settings.prompt_saved);
-        assert!(settings.auto_connect);
+        assert_eq!(settings.url, "");
+        assert!(settings.token.is_none());
+        assert!(settings.profiles.is_empty());
+        assert_eq!(settings.selected_profile, None);
+        assert!(!settings.can_auto_login());
+    }
+
+    #[test]
+    fn bare_proxmox_parses_as_an_empty_url() {
+        let args = Args::parse_from(["ryll", "--proxmox"]);
+        assert_eq!(args.proxmox.as_deref(), Some(""));
+        let args = Args::parse_from(["ryll", "--proxmox", "https://pve.example:8006"]);
+        assert_eq!(args.proxmox.as_deref(), Some("https://pve.example:8006"));
+    }
+
+    #[test]
+    fn bare_proxmox_needs_a_url_outside_the_gui() {
+        for mode in ["--headless", "--web", "--rdp"] {
+            let args = Args::parse_from(["ryll", "--proxmox", mode]);
+            let error = validate_args(&args, None).expect_err(mode);
+            assert!(
+                format!("{error:#}").contains("needs a URL"),
+                "{mode}: {error:#}"
+            );
+        }
+        let args = Args::parse_from(["ryll", "--proxmox", "--proxmox-list"]);
+        assert!(validate_args(&args, None).is_err());
+        let args = Args::parse_from(["ryll", "--proxmox"]);
+        validate_args(&args, None).expect("the GUI can collect the URL");
     }
 
     #[cfg(feature = "gui")]
     #[test]
     fn launch_settings_do_not_reuse_a_token_for_a_different_endpoint() {
         let args = Args::parse_from(["ryll", "--proxmox", "https://other.example:8006"]);
-        let saved = saved_proxmox("https://pve.example:8006", false);
+        let saved = saved_proxmox("https://pve.example", 8006);
         let settings = ProxmoxLaunchSettings::from_args(&args, Some(&saved))
             .expect("settings")
             .expect("proxmox settings");
         assert_eq!(settings.url, "https://other.example:8006");
         assert!(settings.token.is_none());
-        assert!(!settings.prompt_saved);
         assert!(!settings.saved_token_present);
+        assert_eq!(settings.selected_profile, None);
     }
 
     #[test]
-    fn saving_preserves_auto_connect_and_tls() {
+    fn saving_preserves_tls() {
         let args = Args::parse_from(["ryll", "--proxmox", "https://pve.example:8006"]);
-        let saved = SavedProxmox {
-            url: "https://pve.example:8006".to_string(),
+        let saved = saved(vec![ProxmoxProfile {
+            name: "old-name".to_string(),
+            host: "https://pve.example".to_string(),
+            port: 8006,
             token: None,
             insecure: true,
             ca: None,
-            auto_connect: true,
-        };
-        let out = saved_config_for_save(&args, Some(&saved), "root@pam!ryll=secret".to_string());
-        assert_eq!(out.url, "https://pve.example:8006");
+        }]);
+        let client = token_client("https://pve.example:8006");
+        let out = profile_for_save(
+            &args,
+            Some(&saved),
+            Some("root@pam!ryll=secret".to_string()),
+            &["pve1".to_string()],
+            &client,
+        );
+        assert_eq!(out.name, "pve1");
+        assert_eq!(out.host, "https://pve.example");
+        assert_eq!(out.port, 8006);
         assert_eq!(out.token.as_deref(), Some("root@pam!ryll=secret"));
         assert!(out.insecure);
-        assert!(out.auto_connect);
+    }
+
+    #[test]
+    fn saving_a_password_profile_stores_no_token() {
+        let args = Args::parse_from(["ryll", "--proxmox", "https://pve.example:8006"]);
+        let client = token_client("https://pve.example:8006");
+        let out = profile_for_save(&args, None, None, &["pve1".to_string()], &client);
+        assert_eq!(out.name, "pve1");
+        assert_eq!(out.host, "https://pve.example");
+        assert_eq!(out.port, 8006);
+        assert!(out.token.is_none());
     }
 
     #[test]
@@ -1791,7 +2096,7 @@ mod tests {
             "--proxmox-user",
             "root@pam",
         ]);
-        let saved = saved_proxmox("https://pve.example:8006", false);
+        let saved = saved_proxmox("https://pve.example", 8006);
         assert!(auth_for_source(&args, Some(&saved))
             .expect("auth")
             .is_none());
@@ -1807,7 +2112,7 @@ mod tests {
             "--proxmox-user",
             "root@pam",
         ]);
-        let saved = saved_proxmox("https://pve.example:8006", false);
+        let saved = saved_proxmox("https://pve.example", 8006);
         let settings = ProxmoxLaunchSettings::from_args(&args, Some(&saved))
             .expect("settings")
             .expect("proxmox settings");
@@ -1817,18 +2122,20 @@ mod tests {
 
     #[cfg(feature = "gui")]
     #[test]
-    fn launch_settings_prompt_when_an_explicit_url_would_use_a_saved_token() {
+    fn launch_settings_prefill_an_explicit_url_with_a_saved_token() {
         let args = Args::parse_from(["ryll", "--proxmox", "pve.example"]);
-        let saved = saved_proxmox("https://pve.example:8006", false);
+        let saved = saved_proxmox("https://pve.example", 8006);
         let settings = ProxmoxLaunchSettings::from_args(&args, Some(&saved))
             .expect("settings")
             .expect("proxmox settings");
-        assert!(settings.prompt_saved);
+        assert!(settings.token.is_some());
+        assert!(settings.token_from_saved);
+        assert!(!settings.can_auto_login());
     }
 
     #[cfg(feature = "gui")]
     #[test]
-    fn launch_settings_do_not_prompt_for_an_explicit_token() {
+    fn launch_settings_auto_login_with_an_explicit_token() {
         let args = Args::parse_from([
             "ryll",
             "--proxmox",
@@ -1836,11 +2143,26 @@ mod tests {
             "--proxmox-token",
             "root@pam!other=secret",
         ]);
-        let saved = saved_proxmox("https://pve.example:8006", false);
+        let saved = saved_proxmox("https://pve.example", 8006);
         let settings = ProxmoxLaunchSettings::from_args(&args, Some(&saved))
             .expect("settings")
             .expect("proxmox settings");
-        assert!(!settings.prompt_saved);
+        assert!(!settings.token_from_saved);
+        assert!(settings.can_auto_login());
+    }
+
+    #[test]
+    fn server_node_name_prefers_the_matching_node() {
+        let client = token_client("https://epyc.example:8006");
+        assert_eq!(
+            client.server_node_name(&["pve1".to_string(), "epyc".to_string()]),
+            "epyc"
+        );
+        assert_eq!(
+            client.server_node_name(&["pve1".to_string(), "pve2".to_string()]),
+            "pve1"
+        );
+        assert_eq!(client.server_node_name(&[]), "epyc");
     }
 
     fn token_client(url: &str) -> ProxmoxClient {

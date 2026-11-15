@@ -66,7 +66,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 #[cfg(feature = "gui")]
 use eframe::egui;
 use shakenfist_spice_protocol::link::H264Offer;
@@ -169,6 +169,15 @@ fn main() -> Result<()> {
 
     // Parse command line arguments
     let args = Args::parse();
+
+    // A bare launch has no source and no mode-specific work to do, and
+    // it must not open a saved Proxmox connection on its own. Print the
+    // normal help instead. A saved Proxmox connection is opted into with
+    // `--proxmox`.
+    if std::env::args_os().len() == 1 {
+        Args::command().print_help()?;
+        return Ok(());
+    }
 
     // Fail at launch rather than at the first control-socket
     // connection: clap cannot express "--headless or --web".
@@ -284,17 +293,12 @@ fn main() -> Result<()> {
         env!("RYLL_GIT_SHA"),
     );
 
-    // Load the user's saved Proxmox settings only when they can matter:
-    // an explicit `--proxmox`, or a GUI launch with no connection source
-    // at all. A `--file` / `--url` / `--direct` launch never consults
-    // them, so a saved token cannot surprise an unrelated session.
-    let gui_mode = !args.headless && !args.web && !args.rdp;
-    let no_explicit_source = args.url.is_none()
-        && args.file.is_none()
-        && args.direct.is_none()
-        && args.proxmox.is_none();
-    let saved_relevant = crate::proxmox::requested(&args) || (gui_mode && no_explicit_source);
-    let saved_config = if saved_relevant {
+    // Load the user's saved Proxmox settings only for an explicit
+    // `--proxmox` launch. A bare `ryll` prints usage instead of opening a
+    // saved connection, and a `--file` / `--url` / `--direct` launch
+    // never consults them, so a saved token cannot surprise an unrelated
+    // session.
+    let saved_config = if crate::proxmox::requested(&args) {
         crate::config_dir::load()
     } else {
         None
@@ -323,16 +327,14 @@ fn main() -> Result<()> {
     // here: its launcher shows the login and VM list, so the Config only
     // exists after the user picks a guest. Every other mode resolves it
     // now and proceeds through the ordinary single-Config path.
-    let saved_gui = gui_mode && no_explicit_source && saved_proxmox.is_some();
-    let proxmox_gui = gui_mode && (crate::proxmox::requested(&args) || saved_gui);
+    let gui_mode = !args.headless && !args.web && !args.rdp;
+    let proxmox_gui = gui_mode && crate::proxmox::requested(&args);
     let config: Option<Config> = if crate::proxmox::requested(&args) {
         if proxmox_gui {
             None
         } else {
             Some(crate::proxmox::resolve_session(&args, saved_proxmox)?)
         }
-    } else if saved_gui {
-        None
     } else {
         Some(Config::from_args(&args)?)
     };
@@ -1154,12 +1156,46 @@ fn run_web(
     result
 }
 
+/// The inner size a session window opens at.
+///
+/// The Proxmox launcher runs in a smaller dialog window of its own, so
+/// it hands the window back at this size once it has produced a config;
+/// the session's own auto-fit adjusts it again from there.
+#[cfg(feature = "gui")]
+const SESSION_WINDOW_SIZE: [f32; 2] = [800.0, 600.0];
+
+/// The inner size of the Proxmox launcher's dialog window. Narrow
+/// enough to read as a dialog rather than a session window, and tall
+/// enough for the whole login form and for a few guest rows.
+#[cfg(feature = "gui")]
+const PROXMOX_WINDOW_SIZE: [f32; 2] = [560.0, 700.0];
+
 #[cfg(feature = "gui")]
 fn gui_native_options() -> eframe::NativeOptions {
     eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([800.0, 600.0])
+            .with_inner_size(SESSION_WINDOW_SIZE)
             .with_resizable(true),
+        ..Default::default()
+    }
+}
+
+/// Native options for the Proxmox launch, whose window is a compact,
+/// centred connection dialog.
+///
+/// Window geometry persistence is off for this launch. The launcher and
+/// the session share one native window, so the geometry saved at exit
+/// would be the session's (often the guest desktop's size), and the next
+/// launcher would open at that size instead of as a dialog. The session
+/// takes the window over and sets its own size when it starts.
+#[cfg(feature = "gui")]
+fn gui_proxmox_native_options() -> eframe::NativeOptions {
+    eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size(PROXMOX_WINDOW_SIZE)
+            .with_resizable(true),
+        centered: true,
+        persist_window: false,
         ..Default::default()
     }
 }
@@ -1272,8 +1308,8 @@ fn run_gui_proxmox(
     let slot_for_exit = capture_slot.clone();
 
     let result = eframe::run_native(
-        "Ryll - SPICE Client",
-        gui_native_options(),
+        "Ryll - Proxmox VE",
+        gui_proxmox_native_options(),
         Box::new(move |_cc| {
             Ok(Box::new(app::RyllRoot::with_proxmox(
                 setup,

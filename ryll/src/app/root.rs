@@ -237,6 +237,17 @@ impl eframe::App for RyllRoot {
         match self.create_capture(&config) {
             Ok(capture) => {
                 let ctx = ui.ctx().clone();
+                // The launcher ran as a compact dialog. Hand the shared
+                // window back to the session at its usual size and title;
+                // the session's auto-fit may resize it again once the
+                // guest's primary surface arrives.
+                ctx.send_viewport_cmd(egui::ViewportCommand::Title(
+                    "Ryll - SPICE Client".to_owned(),
+                ));
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                    crate::SESSION_WINDOW_SIZE[0],
+                    crate::SESSION_WINDOW_SIZE[1],
+                )));
                 let session = self.setup.build(&ctx, config, capture.clone());
                 *self.capture_slot.lock().expect("capture slot poisoned") = capture.clone();
                 self.session = Some(session);
@@ -249,6 +260,9 @@ impl eframe::App for RyllRoot {
                 if let Some(launcher) = &mut self.launcher {
                     launcher.fail(error);
                 }
+                // The launcher already drew this frame; a failure that
+                // arrived after it is only visible on the next pass.
+                ui.ctx().request_repaint();
             }
         }
     }

@@ -73,6 +73,8 @@ ryll --direct 192.168.1.100:5900
 
 # Proxmox VE: log in, then pick a guest in the GUI (or pass --proxmox-vm)
 ryll --proxmox https://pve.example:8006
+# ...or open the dialog with the most recent saved profile prefilled
+ryll --proxmox
 
 # Headless latency probe
 ryll --file connection.vv --headless --cadence

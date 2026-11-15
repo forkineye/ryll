@@ -90,10 +90,15 @@ pub struct Args {
     /// require --proxmox-vm (or --proxmox-list). This flag does not
     /// create, start, stop or reconfigure guests: ryll only asks
     /// Proxmox for a SPICE console.
+    ///
+    /// In the GUI the URL is optional: bare `--proxmox` opens the
+    /// connection form, prefilled from a saved endpoint when one exists.
     #[arg(
         long,
         group = "config_source",
         value_name = "URL",
+        num_args = 0..=1,
+        default_missing_value = "",
         conflicts_with = "password_file"
     )]
     pub proxmox: Option<String>,

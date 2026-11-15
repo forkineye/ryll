@@ -229,8 +229,8 @@ ryll/src/
 │                        #   implements CaptureSink)
 ├── clipboard_arboard.rs # Host clipboard (implements ClipboardBackend)
 ├── config.rs            # CLI args, .vv parsing
-├── config_dir.rs        # ~/.ryll/config.json: saved Proxmox endpoint,
-│                        #   API token, TLS choice and auto-connect flag
+├── config_dir.rs        # ~/.ryll/config.json: saved Proxmox profiles
+│                        #   (host, port, per-host token and TLS choice)
 ├── display_gui.rs       # TextureCache: egui TextureHandles
 │                        #   keyed by surface
 ├── input_egui.rs        # egui::Key → LogicalKey adapter

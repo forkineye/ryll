@@ -28,7 +28,7 @@ installing software.
   token, pick from the QEMU guests the login can see, and connect to a
   running guest's SPICE console. An endpoint and API token can be saved
   in `~/.ryll/config.json` (mode 0600); passwords are never stored. See
-  [docs/proxmox.md](https://github.com/shakenfist/ryll/blob/develop/docs/proxmox.md).
+  [docs/proxmox.md](docs/proxmox.md).
 - Built for automation and testing: headless and cadence modes, latency and bandwidth
   instrumentation, per-channel pcap capture, and a Unix-socket control
   interface for driving sessions from external tools.
@@ -38,7 +38,7 @@ installing software.
 - Cross-platform: Linux, macOS (Apple Silicon), and Windows, as a
   single static binary.
 
-See [docs/features.md](https://github.com/shakenfist/ryll/blob/develop/docs/features.md)
+See [docs/features.md](docs/features.md)
 for the full feature catalogue.
 
 ## Installation
@@ -58,7 +58,7 @@ pip install ryll
 ```
 
 RPM and Windows packages are also published. See
-[docs/installation.md](https://github.com/shakenfist/ryll/blob/develop/docs/installation.md)
+[docs/installation.md](docs/installation.md)
 for all platforms, runtime dependencies, and building from source.
 
 ## Usage
@@ -88,33 +88,33 @@ ryll --rdp --file connection.vv
 
 `--rdp` is a reachability fallback for machines with an RDP client and no SPICE
 client. Releases do not include it yet; see
-[Getting a binary](https://github.com/shakenfist/ryll/blob/develop/docs/rdp-frontend.md#getting-a-binary)
+[Getting a binary](docs/rdp-frontend.md#getting-a-binary)
 in the RDP guide.
 
-See [docs/configuration.md](https://github.com/shakenfist/ryll/blob/develop/docs/configuration.md)
+See [docs/configuration.md](docs/configuration.md)
 for all command-line options and the .vv file format.
 
 ## Documentation
 
-In the [docs/](https://github.com/shakenfist/ryll/blob/develop/docs/index.md)
+In the [docs/](docs/index.md)
 directory:
 
-- [Documentation Index](https://github.com/shakenfist/ryll/blob/develop/docs/index.md) - What ryll is and why it exists
-- [Features](https://github.com/shakenfist/ryll/blob/develop/docs/features.md) - The detailed feature catalogue and mode guides
-- [Installation](https://github.com/shakenfist/ryll/blob/develop/docs/installation.md) - Pre-built packages and install instructions
-- [Configuration](https://github.com/shakenfist/ryll/blob/develop/docs/configuration.md) - CLI options and .vv file format
-- [Web frontend guide](https://github.com/shakenfist/ryll/blob/develop/docs/web-frontend.md) - Operator guide for `--web` mode
-- [RDP frontend guide](https://github.com/shakenfist/ryll/blob/develop/docs/rdp-frontend.md) - Operator guide for `--rdp` mode
-- [Development](https://github.com/shakenfist/ryll/blob/develop/docs/development.md) - Building, testing, CI, and contributing
-- [macOS Development](https://github.com/shakenfist/ryll/blob/develop/docs/development-macos.md) - Build and test locally on macOS
-- [Troubleshooting](https://github.com/shakenfist/ryll/blob/develop/docs/troubleshooting.md) - Common issues and debugging
-- [Releasing](https://github.com/shakenfist/ryll/blob/develop/docs/releasing.md) - How to publish a new release
+- [Documentation Index](docs/index.md) - What ryll is and why it exists
+- [Features](docs/features.md) - The detailed feature catalogue and mode guides
+- [Installation](docs/installation.md) - Pre-built packages and install instructions
+- [Configuration](docs/configuration.md) - CLI options and .vv file format
+- [Web frontend guide](docs/web-frontend.md) - Operator guide for `--web` mode
+- [RDP frontend guide](docs/rdp-frontend.md) - Operator guide for `--rdp` mode
+- [Development](docs/development.md) - Building, testing, CI, and contributing
+- [macOS Development](docs/development-macos.md) - Build and test locally on macOS
+- [Troubleshooting](docs/troubleshooting.md) - Common issues and debugging
+- [Releasing](docs/releasing.md) - How to publish a new release
 
 Project reference files:
 
-- [ARCHITECTURE.md](https://github.com/shakenfist/ryll/blob/develop/ARCHITECTURE.md) - The crate map, code organisation, and concurrency model
-- [AGENTS.md](https://github.com/shakenfist/ryll/blob/develop/AGENTS.md) - Guide for AI coding assistants
-- [STYLEGUIDE.md](https://github.com/shakenfist/ryll/blob/develop/STYLEGUIDE.md) - Code conventions and patterns
+- [ARCHITECTURE.md](ARCHITECTURE.md) - The crate map, code organisation, and concurrency model
+- [AGENTS.md](AGENTS.md) - Guide for AI coding assistants
+- [STYLEGUIDE.md](STYLEGUIDE.md) - Code conventions and patterns
 
 ## License
 

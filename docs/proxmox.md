@@ -30,6 +30,7 @@ A few API calls precede it:
 | `POST /api2/json/access/ticket` | Password login, returns a ticket and `CSRFPreventionToken`. API-token logins skip it. |
 | `GET /api2/json/nodes` | The cluster's node names. |
 | `GET /api2/json/nodes/{node}/qemu` | The primary VM list. Proxmox returns only the VMs where the caller has `VM.Audit` on `/vms/{vmid}`, which is exactly what per-VM ACLs need. |
+| `GET /api2/json/nodes/{node}/qemu/{vmid}/config` | The guest's `vga` display type, used to say whether a SPICE console is possible. A running guest is read with `?current=1`, because a pending display change only takes effect at the next start. |
 | `GET /api2/json/cluster/resources?type=vm` | Fallback list if the per-node index is unavailable or empty. Ryll keeps the `type: qemu` rows and discards LXC containers. |
 | `POST /api2/spiceconfig/nodes/{node}/qemu/{vmid}/spiceproxy` | The selected guest's `.vv` document. |
 
@@ -76,7 +77,7 @@ Ryll needs exactly two privileges:
 
 | Privilege | Granted on | Why |
 |-----------|------------|-----|
-| `VM.Audit` | `/vms/<vmid>` (or `/vms`, or a pool containing it) | Discover the guest and its node in the picker |
+| `VM.Audit` | `/vms/<vmid>` (or `/vms`, or a pool containing it) | Discover the guest and its node in the picker, read its display configuration, and say whether it can be connected |
 | `VM.Console` | `/vms/<vmid>` | Request the SPICE console document |
 
 `VM.PowerMgmt` is **not** required: ryll does not start, stop or reconfigure
@@ -173,9 +174,29 @@ The guest side matters as well:
 - `spice-vdagent` must be installed and running, because ryll's resize path
   sends `VDAgentMonitorsConfig` through the SPICE guest agent.
 
-A VM with another display model can still show a SPICE console, but ryll's
-desktop resize is tested against VirtIO-GPU and is not guaranteed to follow
-the host window with QXL or standard VGA.
+Only the QXL family (`qxl`, `qxl2`, `qxl3`, `qxl4`) and the VirtIO GPU
+family (`virtio`, `virtio-gl`) run a SPICE server. A guest whose display is
+standard VGA, VMware-compatible, Cirrus, a serial console or `none` gets VNC
+or no graphical console, so Proxmox cannot produce a SPICE document for it.
+
+Ryll reads each guest's `vga` configuration while it builds the list and
+shows the result: the picker's Connect action reads **No SPICE** instead
+when the display cannot carry SPICE, and `--proxmox-list` has a `SPICE`
+column. The disabled action explains itself on hover, and the CLI refuses
+the console with an explanation instead of sending a request that Proxmox
+would reject. A guest with no `vga` key follows Proxmox's own default
+(`std`, or `virtio` on an aarch64 guest). If the configuration cannot be
+read, the action reads **SPICE?** until a refresh retries the probe; the
+probe failure is logged at warn level with the underlying error.
+
+For a running guest ryll reports the display type the running instance
+actually uses. A display change made in the Proxmox UI is pending until the
+guest is restarted, so the row keeps naming the old type (and correctly
+stays connectable while that type supports SPICE) even if the Proxmox
+hardware view already shows the pending value.
+
+The resize path is tested against VirtIO-GPU and is not guaranteed to follow
+the host window with QXL.
 
 ## GUI
 
@@ -199,9 +220,13 @@ unless the installation listens elsewhere. Choose username and password or
 API token, optionally accept the self-signed certificate, and press
 **Connect**. The dialog keeps its primary action pinned at the foot, so a
 long error message or an expanded **Advanced** section scrolls without
-hiding it. Ryll then lists the visible QEMU guests with their node and
-status, and **Connect** is enabled only for running guests. Templates are not
-shown: Proxmox cannot mint a console for them.
+hiding it. Ryll then lists the visible QEMU guests with their node, display
+type and status. **Connect** is enabled only for running guests whose
+display supports SPICE; each row carries a `running`/`stopped` chip, and
+the action itself reads **No SPICE** when the display cannot carry SPICE or
+**SPICE?** when its configuration could not be read. A disabled action
+explains itself on hover, and `SPICE?` stays until a refresh retries the
+probe. Templates are not shown: Proxmox cannot mint a console for them.
 Choosing a guest hands the window to the session, which is sized for the
 guest desktop; the dialog itself exists only for the connection.
 
@@ -365,10 +390,18 @@ ryll --proxmox https://pve.example:8006 \
 be piped into `awk` or `cut`:
 
 ```
-VMID	NODE	STATUS	NAME
-100	pve1	running	web
-101	pve2	stopped	db
+VMID	NODE	STATUS	NAME	SPICE
+100	pve1	running	web	yes
+101	pve2	stopped	db	no
 ```
+
+`SPICE` is `yes` when the guest's display type runs a SPICE server (`qxl`,
+`qxl2`–`qxl4`, `virtio`, `virtio-gl`), `no` when it does not, and `unknown`
+when the display configuration could not be read (those guests are not
+offered for connection until a refresh retries the probe). It is the last
+column, so the earlier columns keep their positions. A stopped guest can
+still be `yes`; start it before connecting. Templates are `no`: Proxmox
+cannot mint a console for them.
 
 ## Reconnecting
 
@@ -386,16 +419,24 @@ and the `--proxmox-vm` path each ask Proxmox for a fresh document.
 - **Stopped guests and templates.** Proxmox cannot mint a console ticket for
   them; the GUI hides templates and disables Connect for stopped guests, and
   the CLI reports why.
-- **A guest whose display is not SPICE.** Proxmox returns an API error when
-  the console document cannot be produced; ryll shows that error rather than
-  dialling a stale address.
+- **A guest whose display is not SPICE.** A standard VGA, VMware, Cirrus,
+  serial or absent display has no SPICE server. The picker disables Connect
+  and the CLI refuses the console with the display type in the message,
+  before asking Proxmox for a document it cannot produce.
+- **A guest whose display configuration could not be read.** The picker
+  shows **SPICE?** in place of Connect; the CLI refuses with the reason.
+  The probe failure is logged at warn level. Refresh the list to retry.
 - **A guest the login cannot see.** The cluster-resource endpoint is already
   ACL-filtered, and `--proxmox-vm` names an ID that is not in the returned
   list as an error with the visible list attached.
 
-Ryll deliberately does not probe every guest's display configuration while
-building the list: that would cost a request per VM and would require
-console permission on every guest merely to draw the picker.
+Building the list costs one `config` request per non-template guest, because
+the QEMU index does not carry the display model. The probes run a few at a
+time and need only `VM.Audit` on the guest — the same privilege the listing
+already requires, not `VM.Console` or any configuration privilege. A probe
+that fails leaves the guest listed, reports its display as `unknown`, and
+keeps Connect disabled until a refresh succeeds; the failure is logged at
+warn level with the reason.
 
 ## Options
 
@@ -411,7 +452,7 @@ console permission on every guest merely to draw the picker.
 | `--proxmox-insecure` | Accept any API certificate. Conflicts with `--proxmox-ca`. |
 | `--proxmox-proxy <HOST>` | Ask Proxmox to put this host in the console document's `proxy=` key. Omit to let Proxmox choose the guest's node. |
 | `--proxmox-vm <VMID>` | Guest to connect to. Required outside the GUI. |
-| `--proxmox-list` | Log in, print the visible QEMU guests, and exit. |
+| `--proxmox-list` | Log in, print the visible QEMU guests with whether each can be given a SPICE console, and exit. |
 | `--proxmox-save` | Save or update a node-named profile in `~/.ryll/config.json` after a successful token login: endpoint host and port, API token and TLS choice. Password logins are never saved. |
 
 ## Troubleshooting

@@ -415,8 +415,23 @@ fn status_pill(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
         });
 }
 
-/// One guest in the picker: name and identity on the left, status and
-/// the connect action on the right.
+/// The guest row's action label. A guest whose display cannot carry SPICE
+/// says so where the user would otherwise click Connect, rather than
+/// adding another chip to the row; `SPICE?` covers the case where the
+/// display configuration could not be read.
+fn connect_label(vm: &ProxmoxVm) -> &'static str {
+    if vm.template {
+        return "Connect";
+    }
+    match vm.supports_spice() {
+        Some(false) => "No SPICE",
+        None => "SPICE?",
+        Some(true) => "Connect",
+    }
+}
+
+/// One guest in the picker: name and identity on the left, display and
+/// run state, then the connect action on the right.
 fn vm_row(ui: &mut egui::Ui, palette: &Palette, vm: &ProxmoxVm, connect: &mut Option<ProxmoxVm>) {
     egui::Frame::new()
         .fill(palette.surface)
@@ -427,7 +442,7 @@ fn vm_row(ui: &mut egui::Ui, palette: &Palette, vm: &ProxmoxVm, connect: &mut Op
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
-                    ui.set_max_width((ui.available_width() - 180.0).max(100.0));
+                    ui.set_max_width((ui.available_width() - 200.0).max(100.0));
                     ui.add(
                         egui::Label::new(
                             egui::RichText::new(vm.display_name())
@@ -438,19 +453,21 @@ fn vm_row(ui: &mut egui::Ui, palette: &Palette, vm: &ProxmoxVm, connect: &mut Op
                         .truncate(),
                     );
                     ui.add_space(3.0);
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "VMID {}  \u{00b7}  node {}",
+                    let identity = match vm.display_type() {
+                        Some(display) => format!(
+                            "VMID {}  \u{00b7}  node {}  \u{00b7}  display {display}",
                             vm.vmid, vm.node
-                        ))
-                        .size(11.0)
-                        .color(palette.dim),
-                    );
+                        ),
+                        None => format!("VMID {}  \u{00b7}  node {}", vm.vmid, vm.node),
+                    };
+                    ui.label(egui::RichText::new(identity).size(11.0).color(palette.dim));
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let button = if vm.is_connectable() {
+                    let connectable = vm.is_connectable();
+                    let label = connect_label(vm);
+                    let button = if connectable {
                         egui::Button::new(
-                            egui::RichText::new("Connect")
+                            egui::RichText::new(label)
                                 .size(11.5)
                                 .strong()
                                 .color(palette.on_accent),
@@ -458,19 +475,15 @@ fn vm_row(ui: &mut egui::Ui, palette: &Palette, vm: &ProxmoxVm, connect: &mut Op
                         .fill(palette.accent)
                         .stroke(egui::Stroke::NONE)
                         .corner_radius(egui::CornerRadius::same(6))
-                        .min_size(egui::vec2(74.0, 27.0))
+                        .min_size(egui::vec2(88.0, 27.0))
                     } else {
-                        egui::Button::new(egui::RichText::new("Connect").size(11.5))
+                        egui::Button::new(egui::RichText::new(label).size(11.5))
                             .corner_radius(egui::CornerRadius::same(6))
-                            .min_size(egui::vec2(74.0, 27.0))
+                            .min_size(egui::vec2(88.0, 27.0))
                     };
                     let response = ui
-                        .add_enabled(vm.is_connectable(), button)
-                        .on_disabled_hover_text(if vm.template {
-                            "This guest is a template; start a clone to get a console"
-                        } else {
-                            "The guest must be running to get a SPICE console"
-                        });
+                        .add_enabled(connectable, button)
+                        .on_disabled_hover_text(vm.connection_blocker().unwrap_or_default());
                     if response.clicked() {
                         *connect = Some(vm.clone());
                     }
@@ -846,14 +859,8 @@ impl ProxmoxLauncher {
     }
 
     fn begin_spice(&mut self, vm: ProxmoxVm) {
-        if !vm.is_connectable() {
-            self.error = Some(format!(
-                "VM {} ({}) is {}{}; a SPICE console needs a running, non-template guest",
-                vm.vmid,
-                vm.display_name(),
-                vm.status.as_deref().unwrap_or("not running"),
-                if vm.template { " template" } else { "" }
-            ));
+        if let Some(blocker) = vm.connection_blocker() {
+            self.error = Some(format!("VM {} ({}): {blocker}", vm.vmid, vm.display_name()));
             return;
         }
         let Some(client) = self.client.clone() else {
@@ -1411,10 +1418,11 @@ impl ProxmoxLauncher {
         ui.add_space(6.0);
         ui.label(
             egui::RichText::new(if guests.is_empty() {
-                "Only running guests can be connected.".to_owned()
+                "Only running guests with a SPICE-capable display can be connected.".to_owned()
             } else {
                 format!(
-                    "{} QEMU guest(s). Only running guests can be connected.",
+                    "{} QEMU guest(s). Only running guests with a SPICE-capable display \
+                     can be connected.",
                     guests.len()
                 )
             })
@@ -1513,7 +1521,34 @@ impl ProxmoxLauncher {
 
 #[cfg(test)]
 mod tests {
-    use super::{compose_endpoint, split_endpoint};
+    use super::{compose_endpoint, connect_label, split_endpoint};
+    use crate::proxmox::ProxmoxVm;
+
+    #[test]
+    fn the_action_label_says_when_spice_is_missing() {
+        let vm = |display: Option<&str>, status: &str, template: bool| ProxmoxVm {
+            vmid: 100,
+            name: None,
+            node: "pve1".to_string(),
+            status: Some(status.to_string()),
+            template,
+            display: display.map(str::to_string),
+        };
+        assert_eq!(connect_label(&vm(Some("qxl"), "running", false)), "Connect");
+        assert_eq!(
+            connect_label(&vm(Some("virtio"), "running", false)),
+            "Connect"
+        );
+        assert_eq!(
+            connect_label(&vm(Some("std"), "running", false)),
+            "No SPICE"
+        );
+        assert_eq!(connect_label(&vm(None, "running", false)), "SPICE?");
+        // A stopped guest's action stays Connect; the disabled hover
+        // carries the run-state reason.
+        assert_eq!(connect_label(&vm(Some("qxl"), "stopped", false)), "Connect");
+        assert_eq!(connect_label(&vm(None, "stopped", true)), "Connect");
+    }
 
     #[test]
     fn split_endpoint_separates_the_port_and_defaults_to_8006() {

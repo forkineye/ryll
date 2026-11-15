@@ -174,7 +174,8 @@ for the chosen guest's SPICE console document. It does not implement VM
 management. The list uses each node's QEMU index, which Proxmox filters to
 the guests where the login has `VM.Audit`; granting that privilege on
 individual `/vms/<vmid>` paths is enough, and `/vms` itself need not be
-granted. The operator guide, including permissions, TLS and troubleshooting,
+granted. That same privilege reads each guest's display configuration, so
+the list can say whether a SPICE console is possible. The operator guide, including permissions, TLS and troubleshooting,
 is [proxmox.md](proxmox.md); this table is the flag reference.
 
 | Option | Default | Description |
@@ -189,11 +190,13 @@ is [proxmox.md](proxmox.md); this table is the flag reference.
 | `--proxmox-insecure` | false | Accept any API certificate, for a self-signed Proxmox that has no stable CA. Conflicts with `--proxmox-ca` |
 | `--proxmox-proxy <HOST>` | Proxmox's choice | Ask Proxmox to put this host in the console document's `proxy=` key. Omit to let it choose the guest's node |
 | `--proxmox-vm <VMID>` | none | Guest to connect to. Required with `--headless`, `--web` and `--rdp`; optional in the GUI, where it skips the picker once the list arrives |
-| `--proxmox-list` | false | Log in, print the visible QEMU guests as a tab-separated table, and exit. Conflicts with `--proxmox-vm` |
+| `--proxmox-list` | false | Log in, print the visible QEMU guests as a tab-separated table with a `SPICE` column, and exit. Conflicts with `--proxmox-vm` |
 | `--proxmox-save` | false | Save or update a node-named profile in `~/.ryll/config.json` after a successful login and list: endpoint host and port, API token and TLS choice. Password logins save the endpoint and TLS settings without a token |
 
 In the GUI, `ryll --proxmox` opens a login form and then a VM picker that
-hides templates; only running QEMU guests can be connected. With no URL it
+hides templates and marks each guest with its display type and whether it
+supports SPICE; only running guests with a SPICE-capable display can be
+connected. With no URL it
 selects the most recently used saved profile and leaves the form blank when
 none exist. The form takes the URL and port
 separately, with the port prefilled as 8006, and its header picker switches

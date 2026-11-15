@@ -17,11 +17,14 @@
 //! - **API token**: `Authorization: PVEAPIToken=USER@REALM!TOKENID=SECRET`.
 //!   Tokens are stateless and need no CSRF header.
 //!
-//! This module only asks Proxmox for console documents. It never calls a
-//! VM lifecycle endpoint: creating, starting, stopping and reconfiguring
-//! guests are explicitly out of scope.
+//! This module never calls a VM lifecycle endpoint: creating, starting,
+//! stopping and reconfiguring guests are explicitly out of scope. It reads
+//! each guest's configuration only to learn its display type, so the list
+//! can say whether a SPICE console is possible.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -38,6 +41,13 @@ use crate::config_dir::{self, ProxmoxProfile, SavedProxmox};
 /// with no explicit port gets this one, so `--proxmox pve.example` works
 /// as an operator expects.
 pub const DEFAULT_PORT: u16 = 8006;
+
+/// How many display-configuration probes run at once while a VM list is
+/// built. One request per guest is required because the QEMU index does
+/// not carry the display model; a handful at a time keeps a large
+/// cluster's list from becoming a long serial chain without opening a
+/// connection per guest at once.
+const DISPLAY_PROBE_WORKERS: usize = 8;
 
 /// How a [`ProxmoxClient`] authenticates.
 #[derive(Clone)]
@@ -80,6 +90,12 @@ pub struct ProxmoxVm {
     /// Templates have a console configuration but cannot be started, so
     /// no SPICE ticket can be minted for them.
     pub template: bool,
+    /// The guest's Proxmox display type (the type in its `vga`
+    /// configuration, such as `qxl`, `virtio` or `std`), when the
+    /// configuration could be read. `None` means the type is unknown:
+    /// either the guest is a template, whose configuration ryll does not
+    /// probe, or the request failed.
+    pub display: Option<String>,
 }
 
 impl ProxmoxVm {
@@ -98,14 +114,78 @@ impl ProxmoxVm {
         self.status.as_deref() == Some("running")
     }
 
-    /// Whether the guest can be given a console. A stopped guest is
+    /// The guest's display type, when its configuration was read.
+    pub fn display_type(&self) -> Option<&str> {
+        self.display.as_deref()
+    }
+
+    /// Whether the display configuration runs a SPICE server.
+    ///
+    /// Proxmox only starts one for the QXL family and the VirtIO GPU
+    /// family; a standard VGA, VMware, Cirrus, serial or absent display
+    /// gets VNC or no graphical console, so no console document can be
+    /// produced for it. `None` means the configuration could not be
+    /// read, so support is unknown.
+    pub fn supports_spice(&self) -> Option<bool> {
+        self.display_type().map(display_type_supports_spice)
+    }
+
+    /// Why this guest cannot be given a SPICE console, or `None` when
+    /// nothing rules it out. The message completes the sentence
+    /// "VM 100 (web) …".
+    ///
+    /// An unreadable display configuration blocks the console. The list
+    /// probes the configuration precisely so the picker can answer this
+    /// question, and offering Connect for a guest whose display type is
+    /// unknown is how a non-SPICE guest slips through: a failed probe
+    /// must read as "not known to support SPICE", not as permission to
+    /// try. Refreshing the list retries the probe.
+    pub fn connection_blocker(&self) -> Option<String> {
+        if self.template {
+            return Some("is a template; start a clone to get a console".to_string());
+        }
+        if !self.is_running() {
+            return Some(format!(
+                "is {}; a SPICE console needs the guest running",
+                self.status.as_deref().unwrap_or("not running")
+            ));
+        }
+        match self.supports_spice() {
+            Some(false) => Some(format!(
+                "uses the display type '{}', which has no SPICE server; set the guest's \
+                 Display to SPICE (qxl) or VirtIO-GPU",
+                self.display_type().unwrap_or("unknown")
+            )),
+            None => Some(
+                "has a display configuration ryll could not read; retry the list to check \
+                 whether it supports SPICE"
+                    .to_string(),
+            ),
+            Some(true) => None,
+        }
+    }
+
+    /// Whether the picker should offer Connect. A stopped guest is
     /// listed with its button disabled; templates are filtered out of
     /// the GUI picker entirely because Proxmox cannot mint a console for
-    /// them. The non-GUI path reports both conditions in `spice_config`.
+    /// them. A guest whose display type could not be read is not offered
+    /// either, until a refresh reads it. The non-GUI path reports every
+    /// condition in `spice_config`.
     #[cfg_attr(not(feature = "gui"), allow(dead_code))]
     pub fn is_connectable(&self) -> bool {
-        self.is_running() && !self.template
+        self.connection_blocker().is_none()
     }
+}
+
+/// Whether Proxmox's QEMU command line starts a SPICE server for a
+/// display type.
+///
+/// `config_to_command` enables SPICE for the QXL family and for any
+/// `virtio*` type, and the VM status endpoint reports the same set. The
+/// QEMU index does not carry the model, which is why the list reads each
+/// guest's configuration.
+fn display_type_supports_spice(display_type: &str) -> bool {
+    display_type.starts_with("virtio") || matches!(display_type, "qxl" | "qxl2" | "qxl3" | "qxl4")
 }
 
 /// An authenticated Proxmox API client.
@@ -190,8 +270,18 @@ impl ProxmoxClient {
     /// List the visible VMs and the node names that were consulted.
     ///
     /// The GUI names a saved profile after the node it connected to, so
-    /// it needs the node list that `list_vms` throws away.
+    /// it needs the node list that `list_vms` throws away. Each guest's
+    /// display configuration is read as well, so the picker and
+    /// `--proxmox-list` can say whether a SPICE console is possible.
     pub fn list_inventory(&self) -> Result<(Vec<ProxmoxVm>, Vec<String>)> {
+        let (mut vms, nodes) = self.list_inventory_unenriched()?;
+        self.annotate_displays(&mut vms);
+        Ok((vms, nodes))
+    }
+
+    /// The VM list as the Proxmox indexes describe it, before the
+    /// per-guest display probes.
+    fn list_inventory_unenriched(&self) -> Result<(Vec<ProxmoxVm>, Vec<String>)> {
         match self.list_vms_per_node() {
             Ok((vms, nodes)) if !vms.is_empty() => Ok((vms, nodes)),
             Ok((per_node_empty, nodes)) => match self.list_vms_from_resources() {
@@ -337,6 +427,7 @@ impl ProxmoxClient {
                 node: node.to_string(),
                 status: vm.status,
                 template: vm.template,
+                display: None,
             })
             .collect())
     }
@@ -372,6 +463,7 @@ impl ProxmoxClient {
                     node,
                     status: resource.status,
                     template: resource.template,
+                    display: None,
                 })
             })
             .collect();
@@ -389,6 +481,109 @@ impl ProxmoxClient {
         nodes
     }
 
+    /// Read each guest's display configuration and record its type.
+    ///
+    /// The QEMU index does not carry the display model, so telling
+    /// whether a SPICE console is possible costs one `config` request
+    /// per guest. The probes run on a few threads at once, because a
+    /// cluster with many guests would otherwise turn the list into a
+    /// long serial chain of round trips. A probe that fails leaves
+    /// `display` as `None`, which is reported as unknown and, with the
+    /// rest of `connection_blocker`, keeps Connect disabled until a
+    /// refresh succeeds. Templates are skipped, since Proxmox cannot
+    /// give them a console whatever their display says.
+    fn annotate_displays(&self, vms: &mut [ProxmoxVm]) {
+        let probes: Vec<usize> = vms
+            .iter()
+            .enumerate()
+            .filter(|(_, vm)| !vm.template)
+            .map(|(index, _)| index)
+            .collect();
+        if probes.is_empty() {
+            return;
+        }
+
+        let workers = DISPLAY_PROBE_WORKERS.min(probes.len());
+        let next = AtomicUsize::new(0);
+        let (tx, rx) = mpsc::channel();
+        let guests: &[ProxmoxVm] = vms;
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                let tx = tx.clone();
+                let next = &next;
+                let probes = &probes;
+                scope.spawn(move || loop {
+                    let position = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(&index) = probes.get(position) else {
+                        break;
+                    };
+                    let display = self.display_for(&guests[index]);
+                    if tx.send((index, display)).is_err() {
+                        break;
+                    }
+                });
+            }
+        });
+
+        // The workers' senders are gone once the scope joins; dropping
+        // this one lets the receiver drain without a blocking wait.
+        drop(tx);
+        for (index, display) in rx {
+            vms[index].display = display;
+        }
+    }
+
+    /// The guest's display type, or `None` when its configuration could
+    /// not be read. A failed probe is logged and leaves the guest listed
+    /// but un-connectable, rather than offering a console ryll cannot
+    /// vouch for.
+    fn display_for(&self, vm: &ProxmoxVm) -> Option<String> {
+        match self.vm_config(vm) {
+            Ok(config) => Some(config.display_type()),
+            Err(error) => {
+                tracing::warn!(
+                    "Proxmox: could not read the display configuration for VM {} on {}: {error:#}",
+                    vm.vmid,
+                    vm.node
+                );
+                None
+            }
+        }
+    }
+
+    fn vm_config(&self, vm: &ProxmoxVm) -> Result<VmConfig> {
+        if !valid_node_name(&vm.node) {
+            bail!("Proxmox returned an invalid node name: {:?}", vm.node);
+        }
+        // A running guest keeps the display model it was started with,
+        // so read its current values: a pending `vga` change only takes
+        // effect at the next start. A stopped guest has no running
+        // instance, and its pending value is what a start would use, so
+        // the default (pending applied) view is the right one there.
+        let suffix = if vm.is_running() {
+            format!(
+                "/api2/json/nodes/{}/qemu/{}/config?current=1",
+                vm.node, vm.vmid
+            )
+        } else {
+            format!("/api2/json/nodes/{}/qemu/{}/config", vm.node, vm.vmid)
+        };
+        let url = api_url(&self.base, &suffix)?;
+        let response = self
+            .authorize(self.http.get(url), false)
+            .send()
+            .map_err(|e| anyhow!("could not reach the Proxmox API: {e}"))?;
+        let body = read_success(
+            response,
+            &format!("Reading the configuration of VM {}", vm.vmid),
+        )?;
+        let envelope: Envelope<VmConfig> = serde_json::from_str(&body)
+            .context("Proxmox returned an unexpected VM configuration")?;
+        envelope
+            .data
+            .ok_or_else(|| anyhow!("Proxmox returned no configuration for VM {}", vm.vmid))
+    }
+
     /// Fetch the guest's `.vv` document and turn it into a [`Config`].
     ///
     /// The `delete-this-file` interpretation ryll already gives a
@@ -397,20 +592,8 @@ impl ProxmoxClient {
     /// reconnect must ask Proxmox for a fresh document. Treating it as
     /// single-use is what suppresses a pointless reconnect loop.
     pub fn spice_config(&self, vm: &ProxmoxVm) -> Result<Config> {
-        if vm.template {
-            bail!(
-                "VM {} ({}) is a template; templates have no running SPICE console",
-                vm.vmid,
-                vm.display_name()
-            );
-        }
-        if !vm.is_running() {
-            bail!(
-                "VM {} ({}) is {}; a SPICE console needs the guest running",
-                vm.vmid,
-                vm.display_name(),
-                vm.status.as_deref().unwrap_or("not running")
-            );
+        if let Some(blocker) = vm.connection_blocker() {
+            bail!("VM {} ({}) {blocker}", vm.vmid, vm.display_name());
         }
 
         let url = self.spice_url(vm)?;
@@ -1104,22 +1287,41 @@ fn profile_for_save(
 
 /// A stable, tab-separated table for `--proxmox-list`, diagnostics and
 /// the error that names the VMs when `--proxmox-vm` is missing.
+///
+/// The `SPICE` column is the display question the picker also answers:
+/// `yes` when the guest's display type runs a SPICE server, `no` when it
+/// cannot (templates included, since no console can be minted for them),
+/// and `unknown` when the configuration could not be read. It is the
+/// last column so the existing columns keep their positions.
 pub fn format_vm_table(vms: &[ProxmoxVm]) -> String {
-    let mut table = String::from("VMID\tNODE\tSTATUS\tNAME\n");
+    let mut table = String::from("VMID\tNODE\tSTATUS\tNAME\tSPICE\n");
     if vms.is_empty() {
         table.push_str("(no QEMU VMs are visible to these credentials)\n");
         return table;
     }
     for vm in vms {
         table.push_str(&format!(
-            "{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\n",
             vm.vmid,
             vm.node,
             vm.status.as_deref().unwrap_or("unknown"),
-            vm.display_name()
+            vm.display_name(),
+            spice_column(vm),
         ));
     }
     table
+}
+
+/// The `SPICE` cell for a guest.
+fn spice_column(vm: &ProxmoxVm) -> &'static str {
+    if vm.template {
+        return "no";
+    }
+    match vm.supports_spice() {
+        Some(true) => "yes",
+        Some(false) => "no",
+        None => "unknown",
+    }
 }
 
 /// The settings the GUI launcher needs, with credentials already read
@@ -1309,6 +1511,73 @@ struct Resource {
     template: bool,
 }
 
+/// The parts of a guest configuration that say whether a SPICE console
+/// is possible. Every other key is irrelevant here and ignored.
+#[derive(Deserialize)]
+struct VmConfig {
+    vga: Option<String>,
+    arch: Option<String>,
+}
+
+impl VmConfig {
+    /// The effective display type.
+    ///
+    /// With no `vga` key, Proxmox's own default applies: `virtio` on an
+    /// aarch64 guest and `std` everywhere else. A `vga` property with no
+    /// type in it is the schema's default key (`std`) by the time QEMU
+    /// builds its command line.
+    fn display_type(&self) -> String {
+        match self.vga.as_deref() {
+            Some(value) => vga_display_type(value).unwrap_or_else(|| "std".to_string()),
+            None if self
+                .arch
+                .as_deref()
+                .is_some_and(|arch| arch.eq_ignore_ascii_case("aarch64")) =>
+            {
+                "virtio".to_string()
+            }
+            None => "std".to_string(),
+        }
+    }
+}
+
+/// The display type out of a Proxmox `vga` property string.
+///
+/// The value is a comma-separated property list whose first positional
+/// element is the type, as in `qxl,memory=64`, `virtio-gl` or
+/// `std,clipboard=vnc`. The named form (`type=qxl`) is accepted too,
+/// because that is what the property parser does.
+fn vga_display_type(value: &str) -> Option<String> {
+    let mut named = None;
+    let mut positional = None;
+    for part in value.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        match part.split_once('=') {
+            Some((key, value)) if key.trim().eq_ignore_ascii_case("type") => {
+                named = normalize_display_type(value);
+            }
+            Some(_) => {}
+            None if positional.is_none() => positional = normalize_display_type(part),
+            None => {}
+        }
+    }
+    named.or(positional)
+}
+
+/// Normalise a display type for comparison: Proxmox writes it lower-case,
+/// but the value comes from an API response and is not worth trusting.
+fn normalize_display_type(value: &str) -> Option<String> {
+    let value = value.trim().trim_matches('"').trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_ascii_lowercase())
+    }
+}
+
 /// Proxmox has returned `template` as both a number and a boolean across
 /// versions, so accept either.
 fn deserialize_template<'de, D>(deserializer: D) -> std::result::Result<bool, D::Error>
@@ -1399,6 +1668,12 @@ mod tests {
         loop {
             match listener.accept() {
                 Ok((stream, _)) => {
+                    // BSD-derived systems, macOS included, let the
+                    // accepted socket inherit the listener's non-blocking
+                    // flag. Clear it, or a read that races the client's
+                    // first byte returns WouldBlock instead of waiting
+                    // out the timeout.
+                    stream.set_nonblocking(false).expect("blocking stream");
                     stream
                         .set_read_timeout(Some(Duration::from_secs(10)))
                         .expect("read timeout");
@@ -1529,6 +1804,10 @@ mod tests {
                     node,
                     status: resource.status,
                     template: resource.template,
+                    // Parsing and filtering do not probe; a display is
+                    // supplied so the connectability checks below are
+                    // about status and templates only.
+                    display: Some("qxl".to_string()),
                 })
             })
             .collect();
@@ -1546,8 +1825,96 @@ mod tests {
     #[test]
     fn table_is_tab_separated_and_names_an_empty_result() {
         let table = format_vm_table(&[]);
-        assert!(table.starts_with("VMID\tNODE\tSTATUS\tNAME\n"));
+        assert!(table.starts_with("VMID\tNODE\tSTATUS\tNAME\tSPICE\n"));
         assert!(table.contains("no QEMU VMs"));
+    }
+
+    fn guest(vmid: u32, status: &str, display: Option<&str>) -> ProxmoxVm {
+        ProxmoxVm {
+            vmid,
+            name: Some(format!("vm{vmid}")),
+            node: "pve1".to_string(),
+            status: Some(status.to_string()),
+            template: false,
+            display: display.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn table_shows_whether_each_guest_supports_spice() {
+        let mut template = guest(103, "stopped", None);
+        template.template = true;
+        let vms = vec![
+            guest(100, "running", Some("qxl")),
+            guest(101, "stopped", Some("std")),
+            guest(102, "running", None),
+            template,
+        ];
+        let table = format_vm_table(&vms);
+        assert_eq!(
+            table.lines().next(),
+            Some("VMID\tNODE\tSTATUS\tNAME\tSPICE")
+        );
+        let rows: Vec<&str> = table.lines().skip(1).collect();
+        assert_eq!(rows[0], "100\tpve1\trunning\tvm100\tyes");
+        assert_eq!(rows[1], "101\tpve1\tstopped\tvm101\tno");
+        assert_eq!(rows[2], "102\tpve1\trunning\tvm102\tunknown");
+        assert_eq!(rows[3], "103\tpve1\tstopped\tvm103\tno");
+    }
+
+    #[test]
+    fn display_type_is_split_out_of_the_vga_property() {
+        assert_eq!(vga_display_type("qxl").as_deref(), Some("qxl"));
+        assert_eq!(vga_display_type("qxl,memory=64").as_deref(), Some("qxl"));
+        assert_eq!(vga_display_type("virtio-gl").as_deref(), Some("virtio-gl"));
+        assert_eq!(
+            vga_display_type("type=virtio,memory=32").as_deref(),
+            Some("virtio")
+        );
+        assert_eq!(
+            vga_display_type("std,clipboard=vnc").as_deref(),
+            Some("std")
+        );
+        assert_eq!(vga_display_type(" std ").as_deref(), Some("std"));
+        assert_eq!(vga_display_type(""), None);
+        assert_eq!(vga_display_type("memory=64"), None);
+    }
+
+    #[test]
+    fn spice_support_needs_a_qxl_or_virtio_display() {
+        for display in ["qxl", "qxl2", "qxl3", "qxl4", "virtio", "virtio-gl"] {
+            assert!(display_type_supports_spice(display), "{display}");
+        }
+        for display in ["std", "cirrus", "vmware", "none", "serial0", "qxl5"] {
+            assert!(!display_type_supports_spice(display), "{display}");
+        }
+    }
+
+    #[test]
+    fn display_type_defaults_follow_proxmox() {
+        let x86: VmConfig = serde_json::from_str("{}").expect("config");
+        assert_eq!(x86.display_type(), "std");
+        let arm: VmConfig = serde_json::from_str(r#"{"arch":"aarch64"}"#).expect("config");
+        assert_eq!(arm.display_type(), "virtio");
+        let explicit: VmConfig =
+            serde_json::from_str(r#"{"vga":"qxl,memory=64","arch":"aarch64"}"#).expect("config");
+        assert_eq!(explicit.display_type(), "qxl");
+        let typeless: VmConfig = serde_json::from_str(r#"{"vga":"memory=64"}"#).expect("config");
+        assert_eq!(typeless.display_type(), "std");
+    }
+
+    #[test]
+    fn a_display_without_spice_is_refused_before_asking_proxmox() {
+        // Port 1 is never listening: the refusal must come from the
+        // display check, not from a failed request.
+        let client = token_client("http://127.0.0.1:1");
+        let mut vm = guest(100, "running", Some("std"));
+        vm.name = Some("web".to_string());
+        let error = client.spice_config(&vm).expect_err("refused");
+        let message = format!("{error:#}");
+        assert!(message.contains("VM 100 (web)"), "{message}");
+        assert!(message.contains("display type 'std'"), "{message}");
+        assert!(message.contains("SPICE (qxl)"), "{message}");
     }
 
     #[test]
@@ -1704,6 +2071,20 @@ mod tests {
                 ]}"#,
                 "application/json",
             );
+
+            // The display probe follows the list, and a running guest is
+            // read with its current (not pending) values.
+            let mut config = accept_with_deadline(&listener);
+            let (request_line, headers, _body) = read_request(&mut config);
+            assert_eq!(
+                request_line,
+                "GET /api2/json/nodes/pve1/qemu/100/config?current=1 HTTP/1.1"
+            );
+            assert_eq!(
+                headers.get("cookie").map(String::as_str),
+                Some("PVEAuthCookie=ticket")
+            );
+            respond(&mut config, r#"{"data":{"vga":"qxl"}}"#, "application/json");
         });
 
         let client = ProxmoxClient::connect(
@@ -1720,6 +2101,8 @@ mod tests {
         assert_eq!(vms.len(), 1);
         assert_eq!(vms[0].vmid, 100);
         assert_eq!(vms[0].node, "pve1");
+        assert_eq!(vms[0].display_type(), Some("qxl"));
+        assert_eq!(vms[0].supports_spice(), Some(true));
         assert!(vms[0].is_connectable());
         server.join().expect("mock server");
     }
@@ -1757,6 +2140,22 @@ mod tests {
                 r#"{"data":[
                     {"vmid":100,"name":"web","status":"running","template":0}
                 ]}"#,
+                "application/json",
+            );
+
+            let mut config = accept_with_deadline(&listener);
+            let (request_line, headers, _body) = read_request(&mut config);
+            assert_eq!(
+                request_line,
+                "GET /api2/json/nodes/pve1/qemu/100/config?current=1 HTTP/1.1"
+            );
+            assert_eq!(
+                headers.get("authorization").map(String::as_str),
+                Some("PVEAPIToken=root@pam!ryll=secret")
+            );
+            respond(
+                &mut config,
+                r#"{"data":{"vga":"virtio,memory=32"}}"#,
                 "application/json",
             );
 
@@ -2205,12 +2604,21 @@ mod tests {
             let (request_line, _, _) = read_request(&mut pve2);
             assert_eq!(request_line, "GET /api2/json/nodes/pve2/qemu HTTP/1.1");
             respond(&mut pve2, r#"{"data":[]}"#, "application/json");
+
+            let mut config = accept_with_deadline(&listener);
+            let (request_line, _, _) = read_request(&mut config);
+            assert_eq!(
+                request_line,
+                "GET /api2/json/nodes/pve1/qemu/100/config?current=1 HTTP/1.1"
+            );
+            respond(&mut config, r#"{"data":{"vga":"qxl"}}"#, "application/json");
         });
 
         let vms = token_client(&url).list_vms().expect("list");
         assert_eq!(vms.len(), 1);
         assert_eq!(vms[0].vmid, 100);
         assert_eq!(vms[0].node, "pve1");
+        assert_eq!(vms[0].supports_spice(), Some(true));
         server.join().expect("mock server");
     }
 
@@ -2242,12 +2650,145 @@ mod tests {
                 r#"{"data":[{"vmid":104,"name":"db","status":"stopped","template":0}]}"#,
                 "application/json",
             );
+
+            // A stopped guest has no running instance, so its pending
+            // configuration is the one a start would use.
+            let mut config = accept_with_deadline(&listener);
+            let (request_line, _, _) = read_request(&mut config);
+            assert_eq!(
+                request_line,
+                "GET /api2/json/nodes/pve2/qemu/104/config HTTP/1.1"
+            );
+            respond(
+                &mut config,
+                r#"{"data":{"vga":"virtio-gl"}}"#,
+                "application/json",
+            );
         });
 
         let vms = token_client(&url).list_vms().expect("list");
         assert_eq!(vms.len(), 1);
         assert_eq!(vms[0].vmid, 104);
         assert_eq!(vms[0].node, "pve2");
+        assert_eq!(vms[0].supports_spice(), Some(true));
+        assert!(!vms[0].is_connectable(), "the guest is stopped");
+        server.join().expect("mock server");
+    }
+
+    /// Answer the display probes `annotate_displays` issues, in whatever
+    /// order its worker threads produce them.
+    fn serve_display_probes(listener: &TcpListener, count: usize) {
+        for _ in 0..count {
+            let mut stream = accept_with_deadline(listener);
+            let (request_line, _headers, _body) = read_request(&mut stream);
+            let body = if request_line.contains("/qemu/100/") {
+                r#"{"data":{"vga":"qxl,memory=64"}}"#
+            } else if request_line.contains("/qemu/101/") {
+                r#"{"data":{"vga":"std"}}"#
+            } else if request_line.contains("/qemu/102/") {
+                // No `vga` key: Proxmox's aarch64 default is virtio.
+                r#"{"data":{"arch":"aarch64"}}"#
+            } else {
+                panic!("unexpected display probe: {request_line}");
+            };
+            respond(&mut stream, body, "application/json");
+        }
+    }
+
+    #[test]
+    fn listing_records_each_guests_display_type() {
+        let (listener, url) = mock_listener();
+        let server = thread::spawn(move || {
+            let mut nodes = accept_with_deadline(&listener);
+            read_request(&mut nodes);
+            respond(
+                &mut nodes,
+                r#"{"data":[{"node":"pve1"}]}"#,
+                "application/json",
+            );
+
+            let mut list = accept_with_deadline(&listener);
+            read_request(&mut list);
+            respond(
+                &mut list,
+                r#"{"data":[
+                    {"vmid":100,"name":"web","status":"running","template":0},
+                    {"vmid":101,"name":"vga","status":"running","template":0},
+                    {"vmid":102,"name":"arm","status":"running","template":0},
+                    {"vmid":103,"name":"tmpl","status":"stopped","template":1}
+                ]}"#,
+                "application/json",
+            );
+
+            // The template is not probed: it cannot get a console
+            // whatever its display says.
+            serve_display_probes(&listener, 3);
+        });
+
+        let vms = token_client(&url).list_vms().expect("list");
+        assert_eq!(vms.len(), 4);
+        assert_eq!(vms[0].display_type(), Some("qxl"));
+        assert!(vms[0].is_connectable());
+        assert_eq!(vms[1].display_type(), Some("std"));
+        assert_eq!(vms[1].supports_spice(), Some(false));
+        assert!(!vms[1].is_connectable());
+        assert!(
+            vms[1]
+                .connection_blocker()
+                .expect("blocked")
+                .contains("display type 'std'"),
+            "the blocker should name the display type"
+        );
+        assert_eq!(vms[2].display_type(), Some("virtio"));
+        assert!(vms[2].is_connectable());
+        assert_eq!(vms[3].display_type(), None);
+        assert!(!vms[3].is_connectable());
+        server.join().expect("mock server");
+    }
+
+    #[test]
+    fn a_failed_display_probe_does_not_offer_the_console() {
+        let (listener, url) = mock_listener();
+        let server = thread::spawn(move || {
+            let mut nodes = accept_with_deadline(&listener);
+            read_request(&mut nodes);
+            respond(
+                &mut nodes,
+                r#"{"data":[{"node":"pve1"}]}"#,
+                "application/json",
+            );
+
+            let mut list = accept_with_deadline(&listener);
+            read_request(&mut list);
+            respond(
+                &mut list,
+                r#"{"data":[{"vmid":100,"name":"web","status":"running","template":0}]}"#,
+                "application/json",
+            );
+
+            let mut config = accept_with_deadline(&listener);
+            read_request(&mut config);
+            respond_status(
+                &mut config,
+                403,
+                r#"{"data":null,"errors":{"permission":"denied"}}"#,
+                "application/json",
+            );
+        });
+
+        let client = token_client(&url);
+        let vms = client.list_vms().expect("list");
+        assert_eq!(vms.len(), 1);
+        assert_eq!(vms[0].display_type(), None);
+        assert_eq!(vms[0].supports_spice(), None);
+        assert!(
+            !vms[0].is_connectable(),
+            "an unreadable display must not be offered as connectable"
+        );
+        let blocker = vms[0].connection_blocker().expect("blocked");
+        assert!(blocker.contains("could not read"), "{blocker}");
+        let error = client.spice_config(&vms[0]).expect_err("refused");
+        assert!(format!("{error:#}").contains("could not read"));
         server.join().expect("mock server");
     }
 
@@ -2276,11 +2817,20 @@ mod tests {
                 r#"{"data":[{"type":"qemu","vmid":100,"name":"web","node":"pve1","status":"running","template":0}]}"#,
                 "application/json",
             );
+
+            let mut config = accept_with_deadline(&listener);
+            let (request_line, _, _) = read_request(&mut config);
+            assert_eq!(
+                request_line,
+                "GET /api2/json/nodes/pve1/qemu/100/config?current=1 HTTP/1.1"
+            );
+            respond(&mut config, r#"{"data":{"vga":"qxl"}}"#, "application/json");
         });
 
         let vms = token_client(&url).list_vms().expect("fallback list");
         assert_eq!(vms.len(), 1);
         assert_eq!(vms[0].vmid, 100);
+        assert_eq!(vms[0].supports_spice(), Some(true));
         server.join().expect("mock server");
     }
 
@@ -2312,11 +2862,24 @@ mod tests {
                 r#"{"data":[{"type":"qemu","vmid":100,"name":"web","node":"pve1","status":"running","template":0}]}"#,
                 "application/json",
             );
+
+            let mut config = accept_with_deadline(&listener);
+            let (request_line, _, _) = read_request(&mut config);
+            assert_eq!(
+                request_line,
+                "GET /api2/json/nodes/pve1/qemu/100/config?current=1 HTTP/1.1"
+            );
+            respond(
+                &mut config,
+                r#"{"data":{"vga":"virtio"}}"#,
+                "application/json",
+            );
         });
 
         let vms = token_client(&url).list_vms().expect("fallback list");
         assert_eq!(vms.len(), 1);
         assert_eq!(vms[0].vmid, 100);
+        assert_eq!(vms[0].supports_spice(), Some(true));
         server.join().expect("mock server");
     }
 }

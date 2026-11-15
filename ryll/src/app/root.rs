@@ -25,7 +25,7 @@ use super::RyllApp;
 use crate::bugreport::PedanticConfig;
 use crate::capture::CaptureSession;
 use crate::config::{Args, Config, ShareDirConfig, VirtualDiskConfig};
-use crate::proxmox::ProxmoxLaunchSettings;
+use crate::proxmox::{ProxmoxLaunchSettings, ProxmoxLogin};
 use shakenfist_spice_protocol::link::H264Offer;
 
 /// Everything a session needs apart from the resolved connection
@@ -151,16 +151,22 @@ impl RyllRoot {
     }
 
     /// A GUI `--proxmox` launch: show the launcher until it produces a
-    /// `Config`.
+    /// `Config`. A `login` already performed from saved credentials starts
+    /// the launcher on the VM list, so no connection dialog appears.
     pub(crate) fn with_proxmox(
         setup: SessionSetup,
         settings: ProxmoxLaunchSettings,
+        login: Option<ProxmoxLogin>,
         capture_dir: Option<PathBuf>,
         capture_slot: Arc<Mutex<Option<Arc<CaptureSession>>>>,
     ) -> Self {
+        let mut launcher = ProxmoxLauncher::new(settings);
+        if let Some(login) = login {
+            launcher.start_logged_in(login);
+        }
         Self {
             session: None,
-            launcher: Some(ProxmoxLauncher::new(settings)),
+            launcher: Some(launcher),
             setup,
             capture_dir,
             capture_slot,

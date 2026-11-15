@@ -204,7 +204,7 @@ the host window with QXL.
 # Open the connection dialog, prefilled from the most recent saved profile
 ryll --proxmox
 
-# Or open it with this endpoint already filled in
+# Log in with the saved token for this endpoint and show the VM picker
 ryll --proxmox https://pve.example:8006
 ```
 
@@ -230,9 +230,16 @@ probe. Templates are not shown: Proxmox cannot mint a console for them.
 Choosing a guest hands the window to the session, which is sized for the
 guest desktop; the dialog itself exists only for the connection.
 
-When a saved token is available, the login form's **Remember this token**
-checkbox is how ryll learns it may write one; see
-[Saved configuration](#saved-configuration).
+An explicit URL whose endpoint has a saved token logs in before the window
+opens: the connection dialog is skipped and ryll shows the VM list directly.
+If that login fails — the token was revoked, or the endpoint is unreachable —
+ryll exits and reports the error on the command line rather than falling
+back to the form. See [Saved profiles](#saved-profiles).
+
+Bare `--proxmox` always shows the form, even when a saved token is available:
+with no URL there is nothing to match the token against, so it is only sent
+after **Connect**. The form's **Remember this token** checkbox is how ryll
+learns it may write one; see [Saved configuration](#saved-configuration).
 
 Supplying credentials on the command line skips the form but still shows the
 list:
@@ -306,9 +313,10 @@ endpoint fields for another host.
 Press **Connect**. After the login and VM list succeed, ryll saves the
 connection as a profile named after the Proxmox node it reached, updating the
 entry for that host and port. Tick **Remember this token** to keep the token;
-ryll always shows this form before connecting to a saved profile. A profile
-whose token was not remembered is still saved — with its endpoint and TLS
-settings but no token.
+a saved profile with a token is reused automatically on the next launch with
+that endpoint. A profile whose token was not remembered is still saved — with
+its endpoint and TLS settings but no token, so its next launch opens the form
+prefilled.
 
 The VM list's **Forget saved token** button removes the token from the profile
 for the connected endpoint; the profile itself (host, port and TLS) remains.
@@ -332,16 +340,23 @@ ryll --proxmox https://pve.example:8006 --proxmox-list
 
 ### Saved profiles
 
-`ryll --proxmox` with no URL uses the most recently used saved profile. The
-normal **Connect to Proxmox VE** form opens with that profile selected; the
-header picker switches to another profile or to **New connection**. A token
-prefilled from a profile is not sent anywhere until **Connect** is pressed:
-in the GUI, ryll never connects to a saved profile automatically.
+An explicit `--proxmox <URL>` whose endpoint matches a saved profile with a
+token logs in automatically: ryll skips the connection dialog and opens the
+VM list. If that login fails, ryll exits and prints the error on the command
+line, and no dialog appears; fix the token, or pass credentials on the
+command line, to recover. Only a matching endpoint reuses a token, so a saved
+token is never sent to a different server.
+
+`ryll --proxmox` with no URL uses the most recently used saved profile for
+the **Connect to Proxmox VE** form, which opens with that profile selected;
+the header picker switches to another profile or to **New connection**. A
+token prefilled from a profile is not sent anywhere until **Connect** is
+pressed. With no URL there is nothing to match the token against, so bare
+`--proxmox` always shows the form.
 
 A profile with no token opens the login form with its URL, port and TLS
 settings prefilled. Headless, web and RDP launches require an explicit
-`--proxmox <URL>`; the matching profile supplies the token and TLS settings,
-and a saved token is never sent to a different endpoint.
+`--proxmox <URL>`; the matching profile supplies the token and TLS settings.
 
 ### Precedence and safety
 
@@ -442,7 +457,7 @@ warn level with the reason.
 
 | Option | Description |
 |--------|-------------|
-| `--proxmox [URL]` | Proxmox VE API URL. The scheme defaults to `https` and the port to 8006; a pasted `/api2/json` suffix is tolerated. In the GUI the URL may be omitted to open the form with the saved profile. |
+| `--proxmox [URL]` | Proxmox VE API URL. The scheme defaults to `https` and the port to 8006; a pasted `/api2/json` suffix is tolerated. In the GUI the URL may be omitted to open the form with the saved profile; an explicit URL with a saved token for that endpoint logs in without the form. |
 | `--proxmox-user <USER>` | Proxmox user ID for password authentication, such as `root@pam`. |
 | `--proxmox-password <PASSWORD>` | Password. Visible in the process list. |
 | `--proxmox-password-file <PATH>` | Read the password from a file, stripping one trailing newline. |
@@ -484,9 +499,11 @@ may audit. Grant `VM.Audit` on that guest's `/vms/<vmid>` path (and
 `VM.Console` on the same path to open its console). Per-VM grants are
 enough; `/vms` itself does not need to be granted.
 
-**The saved token is rejected.** It may have expired or been revoked. Use
-**Forget saved token** in the VM list, or delete `~/.ryll/config.json`, then
-log in and save a new one.
+**The saved token is rejected.** It may have expired or been revoked. An
+explicit `--proxmox <URL>` with that token exits with the error on the command
+line rather than opening the form. Run bare `ryll --proxmox`, select the
+profile in the form, and connect to replace the token; **Forget saved token**
+in the VM list also removes it, or delete `~/.ryll/config.json`.
 
 **`~/.ryll/config.json` is ignored.** Ryll logs the reason. A malformed file
 or one whose schema version this build does not use is not read; a file whose

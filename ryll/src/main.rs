@@ -329,6 +329,7 @@ fn main() -> Result<()> {
     // now and proceeds through the ordinary single-Config path.
     let gui_mode = !args.headless && !args.web && !args.rdp;
     let proxmox_gui = gui_mode && crate::proxmox::requested(&args);
+
     let config: Option<Config> = if crate::proxmox::requested(&args) {
         if proxmox_gui {
             None
@@ -413,6 +414,30 @@ fn main() -> Result<()> {
 
     let obey_guest_size = !args.no_obey_guest_size;
 
+    // A GUI `--proxmox <url>` launch with a saved token for that endpoint
+    // logs in before the window exists. The credentials were found, so the
+    // connection dialog is skipped; a failure therefore has to be a
+    // command-line error rather than a fallback to the form, which is what
+    // the saved credentials were meant to avoid. Bare `--proxmox` still
+    // opens the prefilled form, and explicit command-line credentials keep
+    // their existing in-window login.
+    //
+    // This runs after the local arguments (disks, share, capture, pedantic
+    // directory) have been validated, so a bad local flag is reported
+    // without a network round trip to Proxmox.
+    #[cfg(feature = "gui")]
+    let gui_login = if proxmox_gui && crate::proxmox::uses_saved_credentials(&args, saved_proxmox)?
+    {
+        Some(crate::proxmox::preconnect(&args, saved_proxmox).context(
+            "automatic Proxmox login with the saved credentials failed; pass \
+             --proxmox-token (or --proxmox-user and --proxmox-password) to log \
+             in with explicit credentials, or run bare `ryll --proxmox` to open \
+             the connection form",
+        )?)
+    } else {
+        None
+    };
+
     if args.rdp {
         #[cfg(feature = "rdp")]
         {
@@ -470,6 +495,7 @@ fn main() -> Result<()> {
                     pedantic_config,
                     obey_guest_size,
                     saved_proxmox.cloned(),
+                    gui_login,
                 ),
             }
         }
@@ -1277,6 +1303,7 @@ fn run_gui_proxmox(
     pedantic_config: Option<PedanticConfig>,
     obey_guest_size: bool,
     saved: Option<crate::config_dir::SavedProxmox>,
+    login: Option<crate::proxmox::ProxmoxLogin>,
 ) -> Result<()> {
     info!("Starting GUI (Proxmox)");
 
@@ -1314,6 +1341,7 @@ fn run_gui_proxmox(
             Ok(Box::new(app::RyllRoot::with_proxmox(
                 setup,
                 settings,
+                login,
                 capture_dir,
                 capture_slot,
             )))

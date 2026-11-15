@@ -93,6 +93,9 @@ pub struct Args {
     ///
     /// In the GUI the URL is optional: bare `--proxmox` opens the
     /// connection form, prefilled from a saved endpoint when one exists.
+    /// An explicit URL with a saved token for that endpoint logs in
+    /// automatically and skips the form; if that login fails, ryll exits
+    /// with the error on the command line.
     #[arg(
         long,
         group = "config_source",

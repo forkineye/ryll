@@ -18,7 +18,9 @@ use eframe::egui;
 
 use crate::config::Config;
 use crate::config_dir::{self, ProxmoxProfile};
-use crate::proxmox::{ProxmoxAuth, ProxmoxClient, ProxmoxLaunchSettings, ProxmoxTls, ProxmoxVm};
+use crate::proxmox::{
+    ProxmoxAuth, ProxmoxClient, ProxmoxLaunchSettings, ProxmoxLogin, ProxmoxTls, ProxmoxVm,
+};
 
 /// What the launcher is doing. `client` distinguishes the two non-busy
 /// screens: no client means "log in", a client means "choose a VM".
@@ -586,6 +588,30 @@ impl ProxmoxLauncher {
         }
     }
 
+    /// Start on the VM list for a login that finished before the window
+    /// existed. It is handled exactly like a login performed in the
+    /// launcher — the profile is saved and `--proxmox-vm` is honoured — so
+    /// an automatic login behaves like pressing **Connect**.
+    pub(crate) fn start_logged_in(&mut self, login: ProxmoxLogin) {
+        self.accept_login(login.client, login.vms, login.node_name);
+    }
+
+    fn accept_login(&mut self, client: ProxmoxClient, vms: Vec<ProxmoxVm>, node_name: String) {
+        tracing::info!("Proxmox: logged in; {} QEMU VM(s) visible", vms.len());
+        self.client = Some(client);
+        self.vms = vms;
+        self.stage = Stage::Vms;
+        self.error = None;
+        if self.save_requested && !self.use_token {
+            tracing::warn!(
+                "--proxmox-save stores only API tokens; the endpoint was saved \
+                 without a token"
+            );
+        }
+        self.save_profile(&node_name);
+        self.maybe_auto_vm();
+    }
+
     /// The root application takes the resolved console config and builds
     /// the SPICE session.
     pub(crate) fn take_ready_config(&mut self) -> Option<Config> {
@@ -695,19 +721,7 @@ impl ProxmoxLauncher {
     fn handle(&mut self, event: LauncherEvent) {
         match event {
             LauncherEvent::LoggedIn(Ok((client, vms, node_name))) => {
-                tracing::info!("Proxmox: logged in; {} QEMU VM(s) visible", vms.len());
-                self.client = Some(client);
-                self.vms = vms;
-                self.stage = Stage::Vms;
-                self.error = None;
-                if self.save_requested && !self.use_token {
-                    tracing::warn!(
-                        "--proxmox-save stores only API tokens; the endpoint was saved \
-                         without a token"
-                    );
-                }
-                self.save_profile(&node_name);
-                self.maybe_auto_vm();
+                self.accept_login(client, vms, node_name);
             }
             LauncherEvent::LoggedIn(Err(error)) => {
                 self.error = Some(error);

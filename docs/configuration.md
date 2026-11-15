@@ -180,7 +180,7 @@ is [proxmox.md](proxmox.md); this table is the flag reference.
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--proxmox [URL]` | none | Proxmox VE API URL. The scheme defaults to `https` and the port to 8006; a pasted `/api2/json` suffix is tolerated. Excludes `--url`, `--file` and `--direct`. In the GUI the URL may be omitted, which opens the connection form prefilled from a saved profile; every other mode requires it |
+| `--proxmox [URL]` | none | Proxmox VE API URL. The scheme defaults to `https` and the port to 8006; a pasted `/api2/json` suffix is tolerated. Excludes `--url`, `--file` and `--direct`. In the GUI the URL may be omitted, which opens the connection form prefilled from a saved profile; an explicit URL with a saved token for that endpoint logs in without the form. Every other mode requires it |
 | `--proxmox-user <USER>` | none | Proxmox user ID for password authentication, such as `root@pam` |
 | `--proxmox-password <PASSWORD>` | none | Password for `--proxmox-user`. Visible in the process list; prefer the file form on a shared host |
 | `--proxmox-password-file <PATH>` | none | Read the password from a file, stripping one trailing newline |
@@ -193,10 +193,12 @@ is [proxmox.md](proxmox.md); this table is the flag reference.
 | `--proxmox-list` | false | Log in, print the visible QEMU guests as a tab-separated table with a `SPICE` column, and exit. Conflicts with `--proxmox-vm` |
 | `--proxmox-save` | false | Save or update a node-named profile in `~/.ryll/config.json` after a successful login and list: endpoint host and port, API token and TLS choice. Password logins save the endpoint and TLS settings without a token |
 
-In the GUI, `ryll --proxmox` opens a login form and then a VM picker that
-hides templates and marks each guest with its display type and whether it
-supports SPICE; only running guests with a SPICE-capable display can be
-connected. With no URL it
+In the GUI, `ryll --proxmox` opens a login form, and an explicit
+`ryll --proxmox <URL>` whose endpoint has a saved token logs in
+automatically and skips the form; a failure exits with the error on the
+command line. The VM picker hides templates and marks each guest with its
+display type and whether it supports SPICE; only running guests with a
+SPICE-capable display can be connected. With no URL it
 selects the most recently used saved profile and leaves the form blank when
 none exist. The form takes the URL and port
 separately, with the port prefilled as 8006, and its header picker switches
@@ -212,10 +214,10 @@ ryll --proxmox https://pve.example:8006 \
 # Connect headlessly to VM 100, reusing the saved token
 ryll --proxmox https://pve.example:8006 --proxmox-vm 100 --headless
 
-# Open the GUI picker
+# Log in with this endpoint's saved token and show the GUI picker
 ryll --proxmox https://pve.example:8006
 
-# ...or open it with the most recent profile prefilled
+# ...or open the form with the most recent profile prefilled
 ryll --proxmox
 ```
 
@@ -224,8 +226,10 @@ Unix). The file stores a list of Proxmox profiles, each with a node name
 captured after connecting, its endpoint host and port, its own API token and
 the TLS choice; passwords are never stored. The GUI offers a profile picker,
 **Remember this token** and **Forget saved token**, and saves the connected
-endpoint as a profile named after the Proxmox node. The form always opens
-before connecting to a saved profile. A saved token is only used for the host
+endpoint as a profile named after the Proxmox node. An explicit
+`--proxmox <URL>` with a matching saved token logs in without the form; bare
+`--proxmox` opens the form before connecting, as does an endpoint with no
+saved token. A saved token is only used for the host
 and port it was saved with. See [Proxmox VE](proxmox.md#saved-configuration)
 for the file format,
 `RYLL_CONFIG_DIR`, and the profile form.

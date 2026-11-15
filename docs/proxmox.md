@@ -55,30 +55,8 @@ Authorization: PVEAPIToken=USER@REALM!TOKENID=SECRET
 
 The `PVEAPIToken=` prefix is optional on the command line and in the GUI.
 Token permissions are the intersection of the token's own permissions and
-the backing user's, so grant the token at least:
-
-- `VM.Audit` on `/vms` or on each guest's `/vms/<vmid>` (to see the guest in
-  the list), and
-- `VM.Console` on `/vms/<vmid>` for each guest whose console it should open.
-
-Per-VM access is a first-class case, not a requirement to grant `/vms`
-recursively. A token with:
-
-```
-VM.Audit  on /vms/100
-VM.Console on /vms/100
-VM.Audit  on /vms/104
-VM.Console on /vms/104
-```
-
-sees and can open exactly VMs 100 and 104. Ryll's primary listing is
-`GET /nodes/{node}/qemu`, which Proxmox documents as returning only VMs where
-the caller has `VM.Audit` on `/vms/<vmid>`. A guest the token cannot audit
-does not appear, even if it can be opened by ID.
-
-`VM.Console` alone is not enough to discover a guest: Proxmox has no
-"console-only" listing. Grant `VM.Audit` on the guest as well if it should
-appear in the picker.
+the backing user's. The privileges ryll needs, and a per-VM `pveum` example,
+are in [Required privileges](#required-privileges).
 
 API tokens are the better choice for automation: there is no ticket
 exchange, no CSRF token, and the secret can be revoked independently of the
@@ -91,6 +69,54 @@ user's password.
     nevertheless visible to other users of the host in the process list;
     prefer `--proxmox-password-file` / `--proxmox-token-file`, or the GUI
     form, on a shared machine.
+
+## Required privileges
+
+Ryll needs exactly two privileges:
+
+| Privilege | Granted on | Why |
+|-----------|------------|-----|
+| `VM.Audit` | `/vms/<vmid>` (or `/vms`, or a pool containing it) | Discover the guest and its node in the picker |
+| `VM.Console` | `/vms/<vmid>` | Request the SPICE console document |
+
+`VM.PowerMgmt` is **not** required: ryll does not start, stop or reconfigure
+guests.
+
+Per-VM access is a first-class case, not a requirement to grant `/vms`
+recursively. A login with:
+
+```
+VM.Audit   on /vms/100
+VM.Console on /vms/100
+VM.Audit   on /vms/104
+VM.Console on /vms/104
+```
+
+sees and can open exactly VMs 100 and 104. Ryll's primary listing is
+`GET /nodes/{node}/qemu`, which Proxmox documents as returning only VMs where
+the caller has `VM.Audit` on `/vms/<vmid>`. A guest the login cannot audit
+does not appear, even if it can be opened by ID.
+
+`VM.Console` alone is not enough to discover a guest: Proxmox has no
+"console-only" listing. Grant `VM.Audit` on the guest as well if it should
+appear in the picker.
+
+A custom role with only those privileges, granted to a user and to a
+privilege-separated API token on one VM, looks like this on the Proxmox host:
+
+```bash
+pveum role add RyllConsole -privs "VM.Audit VM.Console"
+pveum acl modify /vms/100 --roles RyllConsole --users alice@pve
+pveum acl modify /vms/100 --roles RyllConsole --tokens 'alice@pve!ryll'
+```
+
+Grant the role on `/pool/<pool>` or `/vms` instead of `/vms/<vmid>` when the
+login should reach more than one guest. With a privilege-separated token,
+grant the role to both the user and the token: the token's effective
+permissions are the intersection of the two.
+
+The built-in `PVEVMUser` role also works but grants more than ryll needs.
+`PVEAuditor` is not sufficient: it has `VM.Audit` but not `VM.Console`.
 
 ## TLS
 
@@ -109,6 +135,47 @@ the SPICE side's TLS comes from the console document's `tls-port` and
 An `http://` URL is accepted for a lab or a loopback test, but it sends the
 password or token in clear. Use `https://` anywhere the network is not
 trusted.
+
+## Display configuration
+
+For the guest desktop to follow ryll's window (or the browser viewport) when
+it is resized, configure the VM with **VirtIO-GPU** and enough video memory.
+Proxmox labels the display model `virtio` and calls it VirtIO-GPU in the web
+UI. A recommended starting point is **32 MiB** of video memory.
+
+In the Proxmox web UI:
+
+- Open the VM → **Hardware** → **Display**.
+- Set **Graphic card** to **VirtIO-GPU**.
+- Set **Memory** to **32 MiB**.
+
+From the Proxmox host shell:
+
+```bash
+qm set <vmid> --vga virtio,memory=32
+```
+
+The corresponding line in `/etc/pve/qemu-server/<vmid>.conf` is:
+
+```
+vga: virtio,memory=32
+```
+
+Stop the VM and start it again after changing the display model or its
+memory. A guest reboot does not reconfigure the virtual display. Raise the
+memory above 32 MiB if a high-resolution guest stops following the window
+once the desktop is large; the video memory limits the usable resolution.
+
+The guest side matters as well:
+
+- the guest must have a VirtIO-GPU driver (the in-tree `virtio_gpu` driver on
+  Linux, the virtio-gpu driver on Windows), and
+- `spice-vdagent` must be installed and running, because ryll's resize path
+  sends `VDAgentMonitorsConfig` through the SPICE guest agent.
+
+A VM with another display model can still show a SPICE console, but ryll's
+desktop resize is tested against VirtIO-GPU and is not guaranteed to follow
+the host window with QXL or standard VGA.
 
 ## GUI
 

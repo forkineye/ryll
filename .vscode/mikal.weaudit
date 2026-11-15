@@ -120,10 +120,6 @@
       "author": "mikal"
     },
     {
-      "path": "tools/check-bidi.sh",
-      "author": "mikal"
-    },
-    {
       "path": "tools/run-shellcheck.sh",
       "author": "mikal"
     },
@@ -420,10 +416,6 @@
       "author": "mikal"
     },
     {
-      "path": "MERGE-TEMPLATE.md",
-      "author": "mikal"
-    },
-    {
       "path": ".github/workflows/codeql-analysis.yml",
       "author": "mikal"
     },
@@ -612,19 +604,11 @@
       "author": "mikal"
     },
     {
-      "path": ".github/workflows/ci.yml",
-      "author": "mikal"
-    },
-    {
       "path": ".github/workflows/fuzz.yml",
       "author": "mikal"
     },
     {
       "path": ".github/workflows/mermaid-lint.yml",
-      "author": "mikal"
-    },
-    {
-      "path": ".github/workflows/rdp-smoke.yml",
       "author": "mikal"
     },
     {

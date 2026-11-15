@@ -105,6 +105,18 @@ repos:
         pass_filenames: false
         files: ^tools/(test-)?rdp-smoke
 
+      # And MERGE-TEMPLATE.md's Wave 0 scanner, whose failure mode is a
+      # scan that reads nothing, or reads the contributor's configuration,
+      # and passes. It runs the real gitleaks and skillsaw through
+      # pre-commit, so its first run needs network. CI's skillsaw job
+      # runs it too.
+      - id: wave0-scan-test
+        name: Wave 0 scanner smoke test
+        entry: ./tools/test-wave0-scan.sh
+        language: script
+        pass_filenames: false
+        files: ^(tools/(test-)?wave0-scan\.sh|tools/check-bidi\.sh|\.pre-commit-config\.yaml)$
+
       # The feature parity matrix: one cell per mode in every row, and a
       # verdict the page defines at the start of every cell.
       - id: parity-matrix

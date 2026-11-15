@@ -25,10 +25,6 @@
       "sha": "7a223bb8c7f0875f3ecee14f61b63dee6c1338b2",
       "date": "2026-08-24"
     },
-    ".github/workflows/ci.yml": {
-      "sha": "3536098cb4503c0426ab889fd50a06c7596405f0",
-      "date": "2026-10-31"
-    },
     ".github/workflows/codeql-analysis.yml": {
       "sha": "975f656d8135aefe12ba2f2094d8671460ef1a8a",
       "date": "2026-10-05"
@@ -65,10 +61,6 @@
       "sha": "0c0cfe362b24e6bc67ccf1ddd09dacc722a0524f",
       "date": "2026-11-03"
     },
-    ".github/workflows/rdp-smoke.yml": {
-      "sha": "a9b1485db379f8081f08a4ddd0a829014228dee2",
-      "date": "2026-10-31"
-    },
     ".github/workflows/supply-chain.yml": {
       "sha": "c855b8e116194dc365244a69aff28900f33023fe",
       "date": "2026-09-26"
@@ -84,10 +76,6 @@
     "Cargo.toml": {
       "sha": "5f2bbfb6c452e5099443414951ce1a9d54d83be1",
       "date": "2026-11-08"
-    },
-    "MERGE-TEMPLATE.md": {
-      "sha": "da51f6b87f9a89d7ab7cdd19cac6a741bc04cd43",
-      "date": "2026-10-05"
     },
     "PLAN-TEMPLATE.md": {
       "sha": "5f63d3a6e67eafc022395259b69fb2024b71bf7d",
@@ -740,10 +728,6 @@
     "tools/build-ryll-wheel.sh": {
       "sha": "8dffe3df5a99e0a3b818bde3bcd13b92d3a5af2b",
       "date": "2026-10-16"
-    },
-    "tools/check-bidi.sh": {
-      "sha": "ea7d6b5bc018c5be3c40f270ea6c5b222631cea7",
-      "date": "2026-07-26"
     },
     "tools/check-parity-matrix.py": {
       "sha": "7891e8c9d403ab30df6519b57c53dc6e45269b43",

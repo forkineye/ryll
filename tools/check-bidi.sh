@@ -11,7 +11,8 @@
 #   check-bidi.sh FILE [FILE ...]   Scan explicitly listed files
 #                                   (as used by the pre-commit hook).
 #
-# Exits 0 on clean, 1 if any suspicious codepoints are found.
+# Exits 0 on clean, 1 if any suspicious codepoints are found, 2 if a
+# file could not be scanned.
 
 set -euo pipefail
 
@@ -25,6 +26,10 @@ set -euo pipefail
 # We combine both into a single PCRE character class. The files are
 # read as bytes; grep -P with LC_ALL=C.UTF-8 interprets the pattern as
 # Unicode codepoints in the input.
+#
+# tools/wave0-scan.sh reads this line, as written, to scan commit
+# messages and patches for the same class; keep it a single
+# single-quoted assignment, or that scan dies.
 PATTERN='[\x{202a}-\x{202e}\x{2066}-\x{2069}\x{200b}-\x{200f}\x{feff}]'
 
 if [ $# -eq 0 ]; then
@@ -52,16 +57,28 @@ if [ ${#EXISTING[@]} -eq 0 ]; then
 fi
 
 FOUND=0
+UNSCANNED=0
 # We run grep once per file so the error output names the file and
 # line. grep exits 1 on no match, 0 on match, 2 on error — we treat
-# match as a failure, no-match as success. -I skips binary files to
-# avoid false positives on fixture assets whose bytes happen to
-# encode a bidi codepoint.
+# match as a failure, no-match as success, and an error as neither: a
+# file grep could not read, or a pattern it could not compile, has not
+# been shown to be clean. -I skips binary files to avoid false
+# positives on fixture assets whose bytes happen to encode a bidi
+# codepoint.
 for f in "${EXISTING[@]}"; do
-    if LC_ALL=C.UTF-8 grep -nPI "$PATTERN" -- "$f" 2>/dev/null; then
-        echo "check-bidi: suspicious Unicode codepoint in $f" >&2
-        FOUND=1
-    fi
+    rc=0
+    LC_ALL=C.UTF-8 grep -nPI "$PATTERN" -- "$f" || rc=$?
+    case $rc in
+        0)
+            echo "check-bidi: suspicious Unicode codepoint in $f" >&2
+            FOUND=1
+            ;;
+        1) ;;
+        *)
+            echo "check-bidi: could not scan $f (grep exited $rc)" >&2
+            UNSCANNED=1
+            ;;
+    esac
 done
 
 if [ $FOUND -ne 0 ]; then
@@ -71,6 +88,10 @@ if [ $FOUND -ne 0 ]; then
     echo "attacks (CVE-2021-42574). Review carefully and remove, or" >&2
     echo "contact a maintainer if the codepoint is intentional." >&2
     exit 1
+fi
+
+if [ $UNSCANNED -ne 0 ]; then
+    exit 2
 fi
 
 exit 0

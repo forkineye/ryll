@@ -15,8 +15,12 @@
 # gate" in docs/ci.md). docs/ci.md also says what record the lane needs
 # before it is proposed for the smoke tier.
 #
-# No fork guard, unlike proxmox-functional.yml: this lane uses no
-# credential and creates nothing outside its runner.
+# Fork-guarded, as ci.yml's smoke tier is. The lane itself uses no
+# credential, but its `vm` runner holds /srv/github/id_ci and
+# ~/.shakenfist regardless, and the job runs the checkout's Makefile and
+# tools/rdp-smoke/ -- and a fork reaches this lane just by editing this
+# file. docs/ci.md has the full reasoning, including why the guard
+# is defence in depth behind GitHub's fork workflow approval.
 name: RDP smoke
 
 on:
@@ -43,6 +47,9 @@ jobs:
     # l because the release build is l-sized, as build-linux's is.
     runs-on: [self-hosted, vm, debian-13-docker, l]
     timeout-minutes: 60
+    if: >-
+      github.event_name != 'pull_request'
+      || github.event.pull_request.head.repo.full_name == github.repository
     # A pull request's push supersedes its earlier run. Any other run,
     # including a dispatch on develop, leaves a running one alone, so a
     # dispatch cannot cancel a nightly whose result is part of the flake

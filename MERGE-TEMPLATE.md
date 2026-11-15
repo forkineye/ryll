@@ -126,48 +126,153 @@ committed — it is for our future selves only.
 ## Step 2: Wave 0 — deterministic scanners
 
 These tools are run first because they cannot be
-manipulated by adversarial content in the diff. If they
+manipulated by adversarial content in the diff — provided
+the copies that run are ours. Every Wave 0 tool and every
+configuration it reads comes from `develop`; the
+contributor's branch is only ever read as data. If they
 find something, we take it seriously regardless of what the
 LLM passes say.
 
-Run these in parallel. Each reports to the management
-session; the management session collates findings.
+**Run Wave 0 locally, before CI, and treat it as the gate on
+CI rather than the other way round.** A pull request from a
+fork runs only `gitleaks` in CI — the rest of the smoke tier
+is fork-guarded (`docs/ci.md`) — so Wave 0 is the only scan
+most of its code gets before the merge queue builds it.
+Approving CI is still a privileged act, because the guard
+lives in a file the fork can edit; see Step 7, which must be
+read before anything is approved.
+
+Fetch the contributor's branch as a ref, and refresh
+`develop` at the same time — a stale `develop` silently
+narrows every diff and every scan below:
+
+```sh
+git fetch origin develop
+gh pr checkout <NN> --branch pr<NN>-review
+```
+
+`gh pr checkout` resolves the fork, its branch and any
+rename. Checking the branch out runs none of its code; what
+must not happen is running anything *from* it, and opening
+the worktree in an editor that runs its `.vscode/` tasks, or
+in a shell where direnv loads its `.envrc`, counts. If `gh` is
+unavailable, add the fork as a remote and
+`git switch -c pr<NN>-review <remote>/<branch>`. One trap:
+if pre-commit is installed as a git hook, a `git commit` in
+this worktree — a pre-merge fix, say — runs the *branch's*
+`.pre-commit-config.yaml`, so commit with `--no-verify`
+until the control-file list below has been read.
+
+Then run the scanners, fetched from `develop` so it does not
+matter which branch is checked out:
+
+```sh
+bash <(git show origin/develop:tools/wave0-scan.sh) pr<NN>-review
+```
 
 | Check | Tool | Looks for |
 |-------|------|-----------|
-| Unicode safety | grep for bidi controls and zero-width chars | Trojan Source (CVE-2021-42574), homoglyph names |
-| Credential leaks | `gitleaks` or `trufflehog` on the diff | API keys, tokens, private keys |
-| Dependency advisories | `cargo audit` | Known-vulnerable crate versions |
-| Dependency policy | `cargo deny check` (if configured) | License changes, source-registry changes, new transitive pulls |
-| Prompt-injection shapes | grep for suspicious natural-language patterns in code/comments/fixtures | "ignore previous instructions", fenced code inside comments, `<\|.*?\|>` tags |
-| Build-script additions | `git diff develop...HEAD -- '**/build.rs' '**/Cargo.toml'` reviewed manually | New `build.rs` files, changed `[build-dependencies]`, new `links =` entries |
+| Lane changes | `CONTROL_PATHS` in `tools/wave0-scan.sh`, listed first, reviewed by eye | a fork editing the workflow, `Makefile`, script, image or scanner configuration that decides what runs and what passes |
+| Build-script additions | `**/build.rs`, `**/Cargo.toml`, `Cargo.lock`, listed, reviewed by eye | new `build.rs` files, changed `[build-dependencies]`, new `links =` entries, unexplained new crates |
+| Unicode safety | `develop`'s `tools/check-bidi.sh` over the changed files | Trojan Source (CVE-2021-42574), homoglyph names |
+| Unicode in metadata | `grep` over every commit's message and patch, merges included | the same codepoints in commit messages, removed lines, lines added then removed again, and merge resolutions |
+| Prompt-injection shapes | `grep` over the same history | "ignore previous instructions", "you are now", "new instructions:" |
+| Credential leaks | `gitleaks git` over `develop..<branch>`, merges diffed against their first parent, inline `gitleaks:allow` ignored, at the rev and with the `.gitleaksignore` `develop` pins | API keys, tokens, private keys |
+| Smuggled agent instructions | `skillsaw lint --no-custom-rules`, at the rev and with the configuration `develop` pins | malformed agent context, instructions aimed at an agent reading the repo |
 
-Concrete commands (adapt paths/branch name as needed):
+The script prints the two by-eye lists before running
+anything, because they are the precondition for everything
+after Wave 0: a changed `Makefile`, `.devcontainer/`,
+`.cargo/` or `.github/` decides what `make lint` and CI
+would run. Read every file on both lists before either.
 
-```sh
-# Unicode / bidi / zero-width
-git diff develop...HEAD | \
-  grep -nP '[\x{202a}-\x{202e}\x{2066}-\x{2069}\x{200b}-\x{200f}\x{feff}]' \
-  || echo "No suspicious unicode."
+A branch that edits the scanners' own documentation, this
+file and `tools/wave0-scan.sh` included, matches the
+prompt-injection shapes they spell out. Such a hit is
+expected: read the printed line, and escalate only if it is
+not the documentation.
 
-# Prompt-injection language (dumb but unfoolable)
-git diff develop...HEAD | \
-  grep -inE 'ignore (all )?(previous|prior|above) (instructions|prompts)|disregard (previous|prior) (instructions|prompts)|system: *you are|you are now|new instructions:' \
-  || echo "No prompt-injection shapes found."
+Each scanner was chosen, and is invoked, so that the
+contributor cannot pick what runs or what passes. The
+contributor's `tools/check-bidi.sh` and
+`.pre-commit-config.yaml` are never used. `gitleaks` scans
+the commit range rather than the index (the upstream
+pre-commit hook scans only staged changes, so on a review
+checkout it passes having read nothing), and runs from a
+checkout of `develop`, so the contributor's `.gitleaks.toml`
+and `.gitleaksignore` are not read. Plain `git log -p`
+prints no patch for a merge commit, so the history scans and
+gitleaks both read merges explicitly; otherwise a secret
+added while resolving a merge would reach nothing. Both read
+every patch as text, so a contributor's `.gitattributes`
+marking a file `-diff`, or a NUL byte in the file, cannot
+turn its patch into `Binary files differ`. gitleaks ignores
+inline `gitleaks:allow` comments, so one cannot hide a key,
+and one in prose is not a finding. A hook pre-commit skips
+is reported as a finding, not as clean. skillsaw has to read the
+contributor's tree, so `develop`'s configuration replaces
+theirs, and `--no-custom-rules` stops it importing any
+Python a configuration names. `tools/test-wave0-scan.sh`
+plants each of those attacks and checks the scan still
+reports, and that nothing from the contributor's tree ran;
+CI's `skillsaw` job runs that test. The script needs GNU
+`grep` (for `-P`), GNU `xargs` (for `-r`) and `pre-commit`,
+so a Linux host or the devcontainer, and stops with an
+error, not a finding, when any is missing.
 
-# Credentials
-gitleaks detect --no-banner --source . --log-opts 'develop..HEAD' \
-  || echo "gitleaks not installed — install or skip with rationale"
+`cargo audit` and `cargo deny` are deliberately absent:
+neither is installed on the host and neither is baked into
+the devcontainer, so locally there is nothing to run. Both
+are PR-time CI jobs (`docs/ci.md`), fork-guarded because a
+fork's `.cargo/config.toml` would steer them, so for a fork
+the local substitute is the `Cargo.lock` review above,
+which is what would catch a hostile new dependency. If a
+local answer is ever needed, add them to
+`.devcontainer/Dockerfile` rather than installing a native
+toolchain on the host.
 
-# Rust advisories
-cargo audit
+Where Wave 0 or the later waves need an actual build, use
+`make lint` and `make test` rather than a native `cargo`
+invocation, but only once the control-file list has been
+read, and only in a disposable clone. The containment is
+narrower than it sounds:
 
-# Build scripts and build-deps — read these by eye
-git diff develop...HEAD -- '**/build.rs' '**/Cargo.toml'
-```
+- The compile runs under `DOCKER_RUN_OFFLINE`, with
+  `--network none`, so a hostile `build.rs` or proc macro in
+  a *dependency* has no egress while it runs.
+- It does not contain the branch's own `Makefile`,
+  `.devcontainer/Dockerfile` or `.cargo/config.toml`. make's
+  recipes run on the host, `make lint` first runs
+  `docker build` on the branch's Dockerfile with network
+  access through the host's docker daemon, and `make fetch`
+  runs networked against the branch's manifests.
+- It does not stop a build script writing to the host. The
+  checkout is mounted read-write, and the cargo cache and
+  `.git` both live inside it, so a build script can poison
+  the cache or plant git configuration (`core.fsmonitor`,
+  `core.hooksPath`) that runs the next time git is used in
+  that checkout
+  ([#470](https://github.com/shakenfist/ryll/issues/470)).
+
+So clone the branch somewhere disposable
+(`git clone --no-local --branch pr<NN>-review . "$TMP/pr<NN>"`),
+run `make` there, and delete the clone afterwards without
+running git in it. Running `make` on an unread fork branch
+is as privileged as approving CI on it.
 
 If any of these fail or surface something, stop and escalate
-to the operator before spending compute on the LLM waves.
+to the operator before spending compute on the LLM waves,
+and before approving CI.
+
+### What CI adds, and why it is not a substitute
+
+On a pull request from this repository CI runs six scanners
+of its own — `cargo audit`, `cargo deny`, `gitleaks`,
+`shellcheck`, `bidi-check` and `skillsaw` (`docs/ci.md`).
+On a fork it runs `gitleaks` alone, with `develop`'s
+configuration: the other five are fork-guarded. So for a
+fork the overlap with Wave 0 is not redundancy but the only
+coverage those checks get before the merge queue.
 
 ### Known alternatives
 
@@ -433,6 +538,37 @@ and monitors it. If CI fails on something the assistant
 and sub-agents missed, return to Step 5 with the new
 finding.
 
+### Approving CI on a fork is a privileged act
+
+For a pull request from a fork, read this before clicking
+anything. Wave 0 and Wave 1 must be clear first.
+
+The `vm` runners the smoke tier, `mermaid-lint.yml`,
+`proxmox-functional.yml` and `rdp-smoke.yml` use hold the
+CI mesh's SSH key and `sfcbr` credentials, and any step that
+runs a fork's code there can read and send both. Each of
+those jobs is fork-guarded, so on a fork only `gitleaks`
+runs. But a fork can delete a guard in the same pull request
+that carries the hostile code, so the guard is not what
+protects the fleet: GitHub's fork workflow approval is, and
+your read. Before pressing "Approve and run", read every
+file on Wave 0's control-file list, `.github/` first. An
+approval given without that read is an approval for the fork
+to run whatever it likes on the fleet. `docs/ci.md` has the
+reasoning, and the command that checks the approval setting
+is still the strict one.
+
+Having approved, expect almost nothing: `Can enqueue`'s jq
+treats a skipped dependency as success, so it goes green on
+a fork having run `gitleaks` alone. Build and test the
+branch locally instead, with `make lint` and `make test` —
+once the control-file list has been read, because `make`
+runs the branch's own `Makefile` and builds its
+`.devcontainer/Dockerfile` on the host before anything is
+isolated (see Wave 0). The first CI build of a fork's code
+is the merge queue, so an ejection there may simply be a
+build failure the smoke tier never got to report.
+
 ## Step 8: Merge and follow up
 
 Once CI passes and triage is complete:
@@ -486,8 +622,8 @@ Before declaring the merge process complete:
 - [ ] Step 0: teachy level recorded.
 - [ ] Step 0: `REVIEW-STATE.md` created in the worktree
       from the template.
-- [ ] Wave 0 deterministic scanners run and results
-      triaged.
+- [ ] Wave 0 deterministic scanners run locally and
+      results triaged, before any CI approval.
 - [ ] Wave 1 LLM safety review complete.
 - [ ] Wave 2 LLM quality review complete.
 - [ ] All findings classified (blocking / follow-up /
@@ -501,6 +637,10 @@ Before declaring the merge process complete:
 - [ ] `docs/plans/PLAN-prNN-followup.md` drafted and
       committed on our follow-up branch *before* merge.
 - [ ] `docs/plans/index.md` and `order.yml` updated.
+- [ ] For a fork: Step 7's fork section read, Wave 0's
+      control-file list read by eye (`.github/` first), and
+      Wave 0 and Wave 1 clear, before CI was approved or
+      `make` was run on the branch.
 - [ ] Operator ran CI and it passed.
 - [ ] Operator merged the external PR.
 - [ ] Our follow-up PR opened immediately after.

@@ -25,6 +25,20 @@ name: CI
 # consume check_paths. Their whole point is to read human-written text,
 # and a secret or a smuggled character lands in documentation or a
 # review note as easily as in code.
+#
+# Every self-hosted job that runs code from the checkout also carries a
+# fork guard, because the `vm` runners hold the CI mesh's SSH key and
+# sfcbr credentials, and a fork can edit whatever such a job runs. The
+# guard is defence in depth: a fork can delete it in the same pull
+# request, so the boundary is GitHub's fork workflow approval and the
+# reviewer reading .github/ first. gitleaks is the one scanner left
+# unguarded, because it reads the fork's content as data; on a fork it
+# takes its configuration from the base branch and scans the pull
+# request's commits a second time, so the fork cannot silence it.
+# docs/ci.md has the threat model and the reasoning; the files a
+# reviewer reads before approving are CONTROL_PATHS in
+# tools/wave0-scan.sh. A new job that runs anything from the checkout
+# needs the guard.
 on:
   pull_request:
     branches: [develop]
@@ -44,11 +58,20 @@ jobs:
     name: "Check paths"
     runs-on: [self-hosted, static]
     timeout-minutes: 10
+    # contents for the merge_group checkout, pull-requests for the
+    # API-backed filter; not the workflow's write scopes.
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
       code_changed: ${{ steps.filter.outputs.code || 'true' }}
     steps:
+      # Only merge_group needs a checkout: there the filter diffs
+      # against base_sha with git. On pull_request it reads the changed
+      # files from the API, as codeql-analysis.yml's check_paths does,
+      # so a fork's content never reaches the persistent static pool.
       - uses: actions/checkout@v7
-        if: github.event_name != 'workflow_dispatch'
+        if: github.event_name == 'merge_group'
       - uses: dorny/paths-filter@v4
         id: filter
         if: github.event_name != 'workflow_dispatch'
@@ -103,6 +126,8 @@ jobs:
     if: >-
       github.event_name != 'merge_group'
       && needs.check_paths.outputs.code_changed != 'false'
+      && (github.event_name != 'pull_request'
+          || github.event.pull_request.head.repo.full_name == github.repository)
     concurrency:
       group: ${{ github.workflow }}-${{ github.ref }}-lint
       cancel-in-progress: true
@@ -143,6 +168,8 @@ jobs:
     if: >-
       github.event_name != 'merge_group'
       && needs.check_paths.outputs.code_changed != 'false'
+      && (github.event_name != 'pull_request'
+          || github.event.pull_request.head.repo.full_name == github.repository)
     concurrency:
       group: ${{ github.workflow }}-${{ github.ref }}-check-windows
       cancel-in-progress: true
@@ -166,6 +193,8 @@ jobs:
     if: >-
       github.event_name != 'merge_group'
       && needs.check_paths.outputs.code_changed != 'false'
+      && (github.event_name != 'pull_request'
+          || github.event.pull_request.head.repo.full_name == github.repository)
     concurrency:
       group: ${{ github.workflow }}-${{ github.ref }}-build-linux
       cancel-in-progress: true
@@ -240,6 +269,8 @@ jobs:
     if: >-
       github.event_name != 'merge_group'
       && needs.check_paths.outputs.code_changed != 'false'
+      && (github.event_name != 'pull_request'
+          || github.event.pull_request.head.repo.full_name == github.repository)
     concurrency:
       group: ${{ github.workflow }}-${{ github.ref }}-cargo-audit
       cancel-in-progress: true
@@ -263,6 +294,8 @@ jobs:
     if: >-
       github.event_name != 'merge_group'
       && needs.check_paths.outputs.code_changed != 'false'
+      && (github.event_name != 'pull_request'
+          || github.event.pull_request.head.repo.full_name == github.repository)
     concurrency:
       group: ${{ github.workflow }}-${{ github.ref }}-cargo-deny
       cancel-in-progress: true
@@ -285,6 +318,9 @@ jobs:
     runs-on: [self-hosted, vm, debian-13, s]
     timeout-minutes: 15
     if: github.event_name != 'merge_group'
+    # The one job that runs on a fork's content; it needs nothing more.
+    permissions:
+      contents: read
     concurrency:
       group: ${{ github.workflow }}-${{ github.ref }}-gitleaks
       cancel-in-progress: true
@@ -295,6 +331,75 @@ jobs:
 
       - name: Install gitleaks
         run: sudo apt-get update && sudo apt-get install -y gitleaks
+
+      # gitleaks reads .gitleaks.toml and .gitleaksignore from the tree
+      # it scans, so a fork could add an allowlist covering its own
+      # findings. Take both from the base branch instead. Inline, not a
+      # tools/ script: this job is unguarded, so it runs nothing from
+      # the checkout. Same-repository pull requests keep their own, so a
+      # false positive can still be ignored in the pull request adding it.
+      # Both fork-only steps below read the base branch as HEAD^1, which
+      # holds only on the merge ref actions/checkout gives a pull_request:
+      # checked out at the head commit instead, HEAD^1 would be a commit
+      # the fork chose. A second parent alone does not prove it, since
+      # the fork's head may itself be a merge, so this checks HEAD^2 is
+      # the pull request's head.
+      - name: Check HEAD is the pull request's merge commit
+        if: >-
+          github.event_name == 'pull_request'
+          && github.event.pull_request.head.repo.full_name != github.repository
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ "$(git rev-parse --verify --quiet HEAD^2)" != "${HEAD_SHA}" ]; then
+            echo "::error::HEAD is not the merge of the pull request's head into its base."
+            exit 1
+          fi
+
+      - name: Take gitleaks configuration from the base branch
+        if: >-
+          github.event_name == 'pull_request'
+          && github.event.pull_request.head.repo.full_name != github.repository
+        run: |
+          for f in .gitleaks.toml .gitleaksignore; do
+            rm -f "$f"
+            if git cat-file -e "HEAD^1:${f}" 2>/dev/null; then
+              git show "HEAD^1:${f}" > "$f" || exit 1
+              echo "Using the base branch's ${f}"
+            else
+              echo "The base branch has no ${f}"
+            fi
+          done
+
+      # The swap above leaves a fork three ways to hide a credential
+      # from gitleaks: an inline gitleaks:allow comment, which silences
+      # the finding on its line whatever the configuration says; a
+      # .gitattributes marking a file -diff, or a NUL byte in it, either
+      # of which prints its patch as "Binary files differ"; and a merge
+      # resolution, which `git log -p` prints no patch for. So the pull
+      # request's commits are scanned again, each merge diffed against
+      # its first parent, and every file read through a textconv that
+      # renames the allow comment. The textconv is attached in
+      # .git/info/attributes, which outranks every .gitattributes, and
+      # a file with a textconv is diffed as text. Debian's gitleaks 8.16
+      # has no --ignore-gitleaks-allow, which tools/wave0-scan.sh uses
+      # instead. The range starts at the merge ref's first parent, not
+      # the event's base.sha, which is stale on a re-run after develop
+      # moves. Inline, like the step above, because this job runs
+      # nothing from the checkout.
+      - name: Scan the pull request's commits, merges included
+        if: >-
+          github.event_name == 'pull_request'
+          && github.event.pull_request.head.repo.full_name != github.repository
+        run: |
+          mkdir -p .git/info && echo '* diff=neutralise-allow' > .git/info/attributes
+          export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=diff.neutralise-allow.textconv \
+            GIT_CONFIG_VALUE_0="sed -e 's/gitleaks:allow/gitleaks-allow-ignored/g'"
+          status=0
+          gitleaks detect --source . --redact --verbose --no-banner \
+            --log-opts="--diff-merges=first-parent HEAD^1..HEAD" || status=$?
+          rm .git/info/attributes
+          exit "$status"
 
       # --log-opts="HEAD" scopes the scan to this branch and the
       # history behind it. Without it gitleaks scans every ref, which
@@ -318,6 +423,8 @@ jobs:
     if: >-
       github.event_name != 'merge_group'
       && needs.check_paths.outputs.code_changed != 'false'
+      && (github.event_name != 'pull_request'
+          || github.event.pull_request.head.repo.full_name == github.repository)
     concurrency:
       group: ${{ github.workflow }}-${{ github.ref }}-shellcheck
       cancel-in-progress: true
@@ -375,7 +482,12 @@ jobs:
     name: bidi and zero-width
     runs-on: [self-hosted, vm, debian-13, s]
     timeout-minutes: 15
-    if: github.event_name != 'merge_group'
+    # Fork-guarded, unlike gitleaks above, because it runs
+    # tools/check-bidi.sh from the checkout, which a fork can edit.
+    if: >-
+      github.event_name != 'merge_group'
+      && (github.event_name != 'pull_request'
+          || github.event.pull_request.head.repo.full_name == github.repository)
     concurrency:
       group: ${{ github.workflow }}-${{ github.ref }}-bidi-check
       cancel-in-progress: true
@@ -413,6 +525,8 @@ jobs:
     if: >-
       github.event_name != 'merge_group'
       && needs.check_paths.outputs.code_changed != 'false'
+      && (github.event_name != 'pull_request'
+          || github.event.pull_request.head.repo.full_name == github.repository)
     concurrency:
       group: ${{ github.workflow }}-${{ github.ref }}-skillsaw
       cancel-in-progress: true
@@ -435,6 +549,15 @@ jobs:
       # names while holding a second runner to do it.
       - name: Lint agent context
         run: pre-commit run skillsaw --all-files
+
+      # MERGE-TEMPLATE.md's Wave 0 scanner, whose failure mode is a scan
+      # that reads nothing, or reads the contributor's configuration, and
+      # passes. Here because its test drives the real gitleaks and
+      # skillsaw through pre-commit, which this job has just installed;
+      # the gitleaks environment is built from the pinned rev on first
+      # use, like skillsaw's above. Scratch repositories only, no Docker.
+      - name: Test the Wave 0 scanner
+        run: ./tools/test-wave0-scan.sh
 
   # Merge tier: the job below runs on merge_group (and on
   # workflow_dispatch) and gates "Can merge". It is the expensive one,
